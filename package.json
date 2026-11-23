@@ -15,10 +15,15 @@
     "test": "tsx --test --test-concurrency=1 tests/*.test.ts",
     "backup": "tsx scripts/backup.ts",
     "doctor": "tsx scripts/doctor.ts",
+    "migrate:models": "tsx scripts/migrate-models.ts",
+    "migrate:voices": "tsx scripts/migrate-voices.ts",
+    "migrate:free-creation": "tsx scripts/migrate-free-creation.ts",
     "retain:workspace": "tsx scripts/retain-workspace.ts"
   },
   "dependencies": {
     "@openai/codex": "0.154.0",
+    "@vue-flow/core": "^1.48.2",
+    "esbuild": "0.28.2",
     "express": "^5.2.1",
     "multer": "^2.0.2",
     "three": "0.186.0",
@@ -27,6 +32,7 @@
     "zod": "^4.3.5"
   },
   "devDependencies": {
+    "@playwright/test": "^1.65.1",
     "@types/express": "^5.0.6",
     "@types/multer": "^2.0.0",
     "@types/node": "^24.0.0",

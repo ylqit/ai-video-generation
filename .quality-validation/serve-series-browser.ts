@@ -1,0 +1,14 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import express from 'express';
+import { Store } from '../src/server/db.js';
+import { createApp } from '../src/server/app.js';
+const manifest = JSON.parse(fs.readFileSync('../docs/architecture/2026-11-23-series-validation/evidence/browser/OFFLINE_REHEARSAL.json', 'utf8'));
+if (manifest.realModelCalls !== 0 || manifest.workerStarted || !path.basename(manifest.root).startsWith('studio-series-rehearsal-')) throw Error('Not the isolated rehearsal');
+const store = new Store(path.join(manifest.root, 'studio.sqlite'));
+if (store.jobs().some(j => ['running', 'submitted', 'unknown'].includes(j.state))) throw Error('Unexpected active jobs');
+const app = express();
+app.use((req, res, next) => req.method !== 'GET' && /\/(model-generate|generate|submit|assistant-runs)(\/|$)/.test(req.path) ? res.status(403).json({ error: 'Offline rehearsal forbids generation' }) : next());
+app.use(createApp(store, manifest.root));
+const server = app.listen(4386, '127.0.0.1', () => console.log('Isolated browser restart at 4386, no Worker'));
+for (const signal of ['SIGINT', 'SIGTERM'] as const) process.on(signal, () => { server.close(); store.close(); process.exit(0); });

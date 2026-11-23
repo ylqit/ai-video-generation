@@ -1,4 +1,7 @@
-import { productionHead } from './creation-heads.js';
+import { storyCoverage } from './story-coverage.js';
+import { effectiveEpisodePlan, episodePredecessor } from './episode-plan.js';
+import { scopeAuthoringProjection } from '../shared/scope-projection.js';
+import { workspaceTarget, workspaceIssues } from './workspace-status.js';
 import { candidateMedia } from './candidate-media.js';
 import { Store, HttpError } from './db.js';
 import { CreationService } from './creation.js';
@@ -8,7 +11,6 @@ import { prepareCreationProduction, creationMediaStatus } from './creation-produ
 import { generationDigest } from './h3-guided.js';
 import {
   scopeInputSchema,
-  scopeSubjectKeys,
   requirementInScope,
   workspaceLayoutSchema,
   type CreationScope,
@@ -19,8 +21,7 @@ import {
 import { type AuthoringStage, type CreationRef, type DirectorResult } from '../shared/creation.js';
 import type { RecordDoc } from '../shared/contracts.js';
 import { projectExecutionText } from '../shared/execution-text.js';
-import { resolveAuthoringStates } from '../shared/authoring-state.js';
-import { resolveStaging, sceneDesignDependencies } from '../shared/staging-projection.js';
+import { fixedSeriesRecord } from './series-production.js';
 
 // One boundary owns selection resolution, authoring version checks and full-work timing.
 export function resolveScope(
@@ -42,78 +43,8 @@ export function resolveScope(
   const directorRef = scope.data.authoring.director;
   if (!directorRef) throw new HttpError(409, '执行范围缺少导演依据');
   const director = store.get(directorRef.id, directorRef.revision).data.result as DirectorResult;
-  const selectedShots = director.shots.filter((s) => scope.data.shotIds.includes(s.id));
-  const knownStates = resolveAuthoringStates(director);
-  const sceneIds = new Set(selectedShots.map((s) => s.sceneId));
   const scriptRef = scope.data.authoring.script;
-  const subjectKeys = scopeSubjectKeys(
-    scriptRef ? store.get(scriptRef.id, scriptRef.revision).data.result : undefined,
-    selectedShots.map((shot) => ({ ...shot, ...knownStates.get(shot.id)! })),
-  );
-  // Authoring records contain the whole work. Compare the actual scoped dependency
-  // projection when a local edit replaced a whole-work record, while keeping the
-  // scope's original fixed references as its executable source of truth.
-  const projection = (stage: string, value: any) => {
-    const { summary: _summary, ...data } = value;
-    if (stage === 'script')
-      return {
-        ...data,
-        scenes: data.scenes.filter((s: any) => sceneIds.has(s.id)),
-        subjects: data.subjects.filter((s: any) => subjectKeys.has(s.key)),
-      };
-    if (stage === 'assets')
-      return {
-        ...data,
-        items: data.items.filter((i: any) =>
-          requirementInScope(
-            i,
-            scriptRef ? store.get(scriptRef.id, scriptRef.revision).data.result : undefined,
-            selectedShots,
-          ),
-        ),
-      };
-    if (stage === 'director') {
-      const projectedStates = resolveAuthoringStates(value);
-      const projectedStaging = resolveStaging(value);
-      let frame = 0;
-      const windows: CreationScope['windows'] = [];
-      for (const shot of data.shots) {
-        if (scope.data.shotIds.includes(shot.id))
-          windows.push({ shotId: shot.id, startFrame: frame, endFrame: frame + shot.frames });
-        frame += shot.frames;
-      }
-      return {
-        ...data,
-        ...(data.sceneDesigns
-          ? {
-              sceneDesigns: data.sceneDesigns
-                .filter((d: any) => sceneIds.has(d.sceneId))
-                .map((d: any) =>
-                  sceneDesignDependencies(
-                    d,
-                    data.shots.filter((s: any) => scope.data.shotIds.includes(s.id)),
-                  ),
-                ),
-            }
-          : {}),
-        shots: data.shots.filter((s: any) => scope.data.shotIds.includes(s.id)),
-        groups: data.groups
-          .filter((g: any) => scope.data.groupIds.includes(g.id))
-          .map((g: any) => ({
-            ...g,
-            shotIds: g.shotIds.filter((id: string) => scope.data.shotIds.includes(id)),
-          })),
-        windows,
-        knownStates: data.shots
-          .filter((s: any) => scope.data.shotIds.includes(s.id))
-          .map((s: any) => [s.id, projectedStates.get(s.id)]),
-        knownStaging: data.shots
-          .filter((s: any) => scope.data.shotIds.includes(s.id))
-          .map((s: any) => [s.id, projectedStaging.get(s.id)]),
-      };
-    }
-    return data;
-  };
+  const script = scriptRef ? store.get(scriptRef.id, scriptRef.revision).data.result : undefined;
   for (const [stage, reference] of Object.entries(scope.data.authoring)) {
     const current = run.data.results[stage];
     const doc = store.get(reference!.id, reference!.revision);
@@ -133,8 +64,12 @@ export function resolveScope(
         latest.parentId !== run.id ||
         !latest.data.adopted ||
         store.get(latest.id).data.stale ||
-        generationDigest(projection(stage, doc.data.result)) !==
-          generationDigest(projection(stage, latest.data.result))
+        generationDigest(
+          scopeAuthoringProjection(stage, doc.data.result, scope.data, director, script),
+        ) !==
+          generationDigest(
+            scopeAuthoringProjection(stage, latest.data.result, scope.data, director, script),
+          )
       )
         throw new HttpError(409, '执行范围包含已修订对象，请明确保存新范围版本');
     }
@@ -192,6 +127,22 @@ export function scopeData(
       group.shotIds.forEach((id) => ids.add(id));
   }
   if (input.mode === 'selection' && !ids.size) throw new HttpError(400, '选择范围不能为空');
+  for (const [groupId, incoming] of Object.entries(input.continuations || {})) {
+    const group = director?.groups.find((g) => g.id === groupId);
+    if (!group || !group.shotIds.some((id) => ids.has(id)))
+      throw new HttpError(400, '接续只能配置当前范围中的生成组');
+    if (!store.get(run.data.episodeId).data.seriesProduction)
+      throw new HttpError(400, '多来源接续需要已绑定的系列制作计划');
+    if (group.transition === 'continuous' && incoming.mode === 'independent')
+      throw new HttpError(400, '连续动作不能用独立来源覆盖，请先修订导演转场');
+    for (const source of incoming.sources)
+      fixedSeriesRecord(
+        store,
+        run.projectId,
+        (source.selection || source.canon)!,
+        source.selection ? 'segment_selection' : 'continuity',
+      );
+  }
   let totalFrames = 0;
   const windows: CreationScope['windows'] = [];
   for (const shot of director?.shots || []) {
@@ -210,6 +161,8 @@ export function scopeData(
     mode: input.mode,
     pending: !director,
     ...(input.executionText ? { executionText: input.executionText } : {}),
+    ...(input.continuations ? { continuations: input.continuations } : {}),
+    ...(input.experiment ? { experiment: input.experiment } : {}),
     authoring: Object.fromEntries(
       Object.entries(run.data.results).filter(([stage]) => stage !== 'editorial'),
     ),
@@ -222,6 +175,12 @@ export function scopeData(
     requestedFrames: windows.reduce((n, w) => n + w.endFrame - w.startFrame, 0),
     output: input.output || {
       ...new CreationService(store).settings(run.projectId).data.policy.output,
+      ...(run.data.effectivePlan
+        ? {
+            width: run.data.effectivePlan.canvas.width,
+            height: run.data.effectivePlan.canvas.height,
+          }
+        : {}),
       seed: 0,
     },
   };
@@ -349,7 +308,11 @@ export class WorkspaceService {
       const scope = id
         ? this.store.update(id, revision!, data)
         : this.store.create('creation_scope', run.projectId, data, run.id);
-      new DomainService(this.store).dependencies(scope, Object.values(data.authoring));
+      const domain = new DomainService(this.store);
+      domain.dependencies(scope, [
+        ...Object.values(data.authoring),
+        ...domain.refs(data.continuations || {}),
+      ]);
       const active = activate || run.data.scope?.id === id;
       const next = active
         ? this.store.update(run.id, run.revision, {
@@ -454,24 +417,21 @@ export class WorkspaceService {
     });
   }
 
-  snapshot(projectId: string, runId?: string, episodeId?: string): WorkspaceSnapshot {
+  snapshot(
+    projectId: string,
+    runId?: string,
+    episodeId?: string,
+    seriesId?: string,
+  ): WorkspaceSnapshot {
     const service = new CreationService(this.store),
       project = new StudioService(this.store).project(projectId);
-    const episodes = this.store.list('episode', projectId).filter((e) => !e.data.archived);
-    if (episodeId && !episodes.some((e) => e.id === episodeId))
-      throw new HttpError(400, '分集不属于项目');
-    const eligibleRuns = this.store
-      .list('creation_run', projectId)
-      .filter((r) => !r.data.archived && (!episodeId || r.data.episodeId === episodeId));
-    const run = runId
-      ? service.get(runId)
-      : eligibleRuns
-          .filter((r) => productionHead(this.store, r.data.episodeId).runId === r.id)
-          .at(-1) ||
-        eligibleRuns.at(-1) ||
-        null;
-    if (run && (run.projectId !== projectId || (episodeId && run.data.episodeId !== episodeId)))
-      throw new HttpError(400, '创作运行不属于当前项目或分集');
+    const { run, episodes, context } = workspaceTarget(
+      this.store,
+      projectId,
+      runId,
+      episodeId,
+      seriesId,
+    );
     const results: WorkspaceSnapshot['results'] = {};
     if (run) {
       for (const [stage, reference] of Object.entries(run.data.results || {}) as [
@@ -482,7 +442,7 @@ export class WorkspaceService {
         if (!this.store.get(doc.id).data.stale && !doc.data.archived) results[stage] = doc;
       }
       for (const doc of this.store
-        .list('authoring_result', projectId)
+        .list('authoring_result', projectId, run.id)
         .filter(
           (r) =>
             r.parentId === run.id &&
@@ -497,12 +457,12 @@ export class WorkspaceService {
           results[doc.data.stage as AuthoringStage] = doc;
     }
     const scopes = this.store
-      .list('creation_scope', projectId)
+      .list('creation_scope', projectId, run?.id)
       .filter((s) => s.parentId === run?.id) as RecordDoc<CreationScope>[];
     const scope = run?.data.scope
       ? (this.store.get(run.data.scope.id, run.data.scope.revision) as RecordDoc<CreationScope>)
       : null;
-    const allJobs = this.store.jobs(projectId);
+    const allJobs = run ? this.store.jobs(projectId, run.data.episodeId) : [];
     const runJobs = allJobs.filter(
       (j) =>
         run &&
@@ -510,8 +470,17 @@ export class WorkspaceService {
           j.input.context?.runId === run.id ||
           scope?.data.candidates?.some((c) => c.jobId === j.id)),
     );
-    const media = this.store.list('asset', projectId);
-    const reviews = this.store.list('generation_review', projectId);
+    // Evidence frames load on candidate detail. The overview only needs playable
+    // media from this episode's jobs, so unrelated episodes are not deserialized.
+    const media = run
+      ? this.store.db
+          .prepare(
+            "SELECT d.* FROM documents d JOIN jobs j ON json_extract(d.data,'$.jobId')=j.id WHERE d.kind='asset' AND d.project_id=? AND j.episode_id=? AND (json_extract(d.data,'$.mediaType')='video' OR json_extract(d.data,'$.category')='original_audio') ORDER BY d.created_at,d.id",
+          )
+          .all(projectId, run.data.episodeId)
+          .map((r) => this.store.decode(r))
+      : [];
+    const reviews = run ? this.store.list('generation_review', projectId, run.data.episodeId) : [];
     const candidates: WorkspaceSnapshot['candidates'] = runJobs
       .filter((j) => j.kind === 'generation')
       .map((job) =>
@@ -550,6 +519,15 @@ export class WorkspaceService {
       inScope: !scope || requirementInScope(item, results.script?.data.result, scopedShots),
     }));
     const subjects = results.script?.data.result.subjects || [];
+    context.issues = workspaceIssues(
+      this.store,
+      context,
+      run,
+      results,
+      scope,
+      requirements,
+      runJobs,
+    );
     const cards: WorkspaceSnapshot['cards'] = [
       ...Object.values(results).map((r) => ({
         id: r.id,
@@ -719,6 +697,7 @@ export class WorkspaceService {
           }
         : null,
       results,
+      context,
       sources,
       subjects,
       assets: [...referenced.values()],
@@ -727,6 +706,18 @@ export class WorkspaceService {
       allowance: service.allowance(projectId),
       layout: this.layout(projectId),
       requirements,
+      storyCoverage: storyCoverage(this.store, run, results),
+      productionRequirements: run
+        ? {
+            fixed: run.data.effectivePlan || null,
+            current: effectiveEpisodePlan(
+              this.store,
+              this.store.get(run.data.episodeId),
+              run.data.request,
+            ),
+            predecessor: episodePredecessor(this.store, this.store.get(run.data.episodeId)),
+          }
+        : null,
       candidates,
       jobs: runJobs.map(({ input, ...job }) => ({
         ...job,
@@ -740,7 +731,7 @@ export class WorkspaceService {
           id: `run:${i}`,
         })),
         ...this.store
-          .list('creation_message', projectId)
+          .list('creation_message', projectId, run?.id)
           .filter((m) => m.parentId === run?.id)
           .map((m) => ({
             id: m.id,

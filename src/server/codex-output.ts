@@ -1,6 +1,9 @@
+import { assistantDecisionSchema } from '../shared/assistant.js';
+import { seriesProposalResultSchema } from '../shared/series-proposal.js';
 import { z } from 'zod';
 import { authoringSchemas, shotCueSchema } from '../shared/creation.js';
 import { discussionResponseSchema } from '../shared/creation-media.js';
+import { localReplacementSchemas } from '../shared/authoring-replacement.js';
 
 const script = authoringSchemas.script;
 const scene = script.shape.scenes.element;
@@ -29,13 +32,20 @@ export const codexOutputSchemas = {
       .array(),
   }),
   discussion: discussionResponseSchema,
+  assistant: assistantDecisionSchema,
+  series_proposal: seriesProposalResultSchema,
 };
 
 // One dialect boundary adapts every nested optional field. It does not change
 // domain defaults or convert explicitly nullable unknown geometry into values.
-export function codexOutputJsonSchema(stage: keyof typeof codexOutputSchemas) {
-  const schema: any = z.toJSONSchema(codexOutputSchemas[stage], { io: 'output' });
-  if (stage !== 'discussion') {
+export function codexOutputJsonSchema(stage: keyof typeof codexOutputSchemas, local = false) {
+  const schema: any = z.toJSONSchema(
+    local && (stage === 'script' || stage === 'director')
+      ? localReplacementSchemas[stage]
+      : codexOutputSchemas[stage],
+    { io: 'output' },
+  );
+  if (stage !== 'discussion' && stage !== 'assistant' && stage !== 'series_proposal' && !local) {
     schema.properties.contractRevision = { type: 'number', const: 2 };
     schema.required = [...new Set([...(schema.required || []), 'contractRevision'])];
   }
@@ -66,9 +76,17 @@ export function decodeCodexOutput(stage: string, value: unknown): unknown {
   // Keep malformed authoring outputs intact for the normal diagnostic/repair
   // path. Only the transport's optional-translation sentinel is normalized.
   if (stage in authoringSchemas && value && typeof value === 'object') {
-    const schema: any = z.toJSONSchema(authoringSchemas[stage as keyof typeof authoringSchemas], {
-      io: 'output',
-    });
+    const local =
+      (value as any).protocol === 'local-authoring-v1' &&
+      (stage === 'script' || stage === 'director');
+    const schema: any = z.toJSONSchema(
+      local
+        ? localReplacementSchemas[stage as 'script' | 'director']
+        : authoringSchemas[stage as keyof typeof authoringSchemas],
+      {
+        io: 'output',
+      },
+    );
     const nullable = (s: any): boolean =>
       s.type === 'null' || (s.anyOf || s.oneOf || []).some(nullable);
     const normalize = (data: any, shape: any) => {

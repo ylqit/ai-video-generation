@@ -201,33 +201,37 @@ export function registerDomainRoutes(
     const dir = inside(root, `jobs/crop-${randomUUID()}`);
     await fs.mkdir(dir, { recursive: true });
     const file = path.join(dir, 'crop.png');
-    await runProcess(config.ffmpeg, [
-      '-y',
-      '-v',
-      'error',
-      '-i',
-      inside(root, original.data.path),
-      '-vf',
-      `crop=${body.width}:${body.height}:${body.x}:${body.y}:exact=1`,
-      '-frames:v',
-      '1',
-      file,
-    ]);
-    const { revision, ...parameters } = body;
-    res.status(201).json(
-      await ingestAsset(store, root, original.projectId, file, {
-        name: `${original.data.name} · 裁剪候选`,
-        category: 'reference',
-        sourceAssetIds: [original.id],
-        derivedSource: {
-          jobId: null,
-          media: { id: original.id, revision },
-          kind: 'crop',
-          frameIndex: null,
-          interval: null,
-          parameters,
-        },
-      }),
-    );
+    try {
+      await runProcess(config.ffmpeg, [
+        '-y',
+        '-v',
+        'error',
+        '-i',
+        inside(root, original.data.path),
+        '-vf',
+        `crop=${body.width}:${body.height}:${body.x}:${body.y}:exact=1`,
+        '-frames:v',
+        '1',
+        file,
+      ]);
+      const { revision, ...parameters } = body;
+      res.status(201).json(
+        await ingestAsset(store, root, original.projectId, file, {
+          name: `${original.data.name} · 裁剪候选`,
+          category: 'reference',
+          sourceAssetIds: [original.id],
+          derivedSource: {
+            jobId: null,
+            media: { id: original.id, revision },
+            kind: 'crop',
+            frameIndex: null,
+            interval: null,
+            parameters,
+          },
+        }),
+      );
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
   });
 }

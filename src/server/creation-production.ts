@@ -1,4 +1,9 @@
 import { z } from 'zod';
+import { assertEpisodePlanCurrent, episodePredecessor } from './episode-plan.js';
+import { formatComparison } from '../shared/production-plan.js';
+import { subjectBindingIssues } from './subject-bindings.js';
+import { bindExperimentInput } from './experiment-binding.js';
+import { ModelRegistry } from './model-registry.js';
 import { Store, HttpError } from './db.js';
 import { assertProductionHead } from './creation-heads.js';
 import { StudioService } from './service.js';
@@ -90,15 +95,8 @@ export function creationMediaStatus(store: Store, run: RecordDoc) {
     const selection = selections.filter((d) => d.data.segmentId === segment.id).at(-1);
     const parts = selection ? selectionMedia(selection.data) : [];
     const current = parts.every((p) => {
-      const media = store.get(p.video.id, p.video.revision),
-        review = store.get(p.review.id, p.review.revision);
-      return (
-        media.projectId === run.projectId &&
-        media.data.adopted &&
-        !store.get(media.id).data.stale &&
-        !store.get(review.id).data.stale &&
-        review.data.inspected
-      );
+      const media = store.get(p.video.id, p.video.revision);
+      return media.projectId === run.projectId && media.data.mediaType === 'video';
     });
     return {
       id: segment.id,
@@ -151,8 +149,11 @@ export function creationMediaStatus(store: Store, run: RecordDoc) {
 // not storytelling. The old episode schema is reached only at the execution boundary.
 function materialize(store: Store, run: RecordDoc, results: Results) {
   assertProductionHead(store, run);
+  assertEpisodePlanCurrent(store, run);
   if (run.data.schemaVersion !== 9) throw new HttpError(409, '当前程序仅支持 V9 生成');
   const scope = resolveScope(store, run);
+  if (scope.data.experiment && scope.data.groupIds.length !== 1)
+    throw new HttpError(400, '一份实验案例只对应一个明确生成组');
   const sourceResults = results;
   results = projectExecutionText(results, scope.data.executionText);
   const script = results.script as ScriptResult,
@@ -227,12 +228,29 @@ function materialize(store: Store, run: RecordDoc, results: Results) {
     ? resolveSeries(store, ep).production.sharedReferences
     : [];
   const definitions = new Map<string, any>();
+  const mappingIssues = subjectBindingIssues(store, run, script);
+  if (mappingIssues.length)
+    return updateRun(store, run, {
+      state: 'needs_revision',
+      issues: mappingIssues.map((message) => issue('subject_mapping', message)),
+    });
   for (const subject of script.subjects) {
     // Explicit existing instance IDs from fixed source records can be reused.
-    const sourceEntity = [...run.data.sources, ...sharedReferences]
-      .map((r) => store.get(r.id, r.revision))
-      .find((d) => d.kind === 'entity' && d.data.instances.some((i: any) => i.id === subject.key));
-    const instanceId = sourceEntity ? subject.key : `${run.id}:${subject.key}`;
+    const explicit = run.data.subjectBindings?.find((b: any) => b.subjectKey === subject.key);
+    const sourceEntity =
+      explicit?.decision === 'reuse'
+        ? store.get(explicit.entity.id, explicit.entity.revision)
+        : explicit?.decision === 'new'
+          ? null
+          : [...run.data.sources, ...sharedReferences]
+              .map((r) => store.get(r.id, r.revision))
+              .find(
+                (d) =>
+                  d.kind === 'entity' && d.data.instances.some((i: any) => i.id === subject.key),
+              );
+    const instanceId = sourceEntity
+      ? explicit?.instanceId || subject.key
+      : `${run.id}:${subject.key}`;
     const locations = [
       ...new Set(
         fullDirector.shots
@@ -324,16 +342,6 @@ function materialize(store: Store, run: RecordDoc, results: Results) {
   // Persist useful asset requests even when execution is still waiting on real media.
   run = updateRun(store, run, { mappings });
   const missing: CreationIssue[] = [];
-  for (const c of referenceCoverage(director, requirements, bindings))
-    if (c.status !== 'inspected_reference')
-      missing.push(
-        issue(
-          'reference_coverage_missing',
-          `镜头 ${c.shotId} 的关键交互 ${c.interactionId} 需要明确覆盖的参考和实际看图确认；组首帧不能代表后续机位。`,
-          c.shotId,
-          'evidence',
-        ),
-      );
   for (const item of requirements) {
     const binding = bindings[item.id];
     if (!binding) {
@@ -380,18 +388,31 @@ function materialize(store: Store, run: RecordDoc, results: Results) {
       continue;
     }
     const asset = domain.owned(run.projectId, binding.asset, 'asset');
-    if (
-      !asset.data.adopted ||
-      asset.data.mediaType !== item.mediaType ||
-      store.get(asset.id).data.stale ||
-      !binding.inspected
-    )
+    if (asset.data.mediaType !== item.mediaType)
       missing.push(
         issue('asset_review_required', `资产 ${item.id} 需要重新审核`, item.id, 'evidence'),
       );
   }
   if (missing.length) return updateRun(store, run, { issues: missing, state: 'awaiting_assets' });
-  const executionIssues = authoringExecutionIssues(director);
+  const executionIssues = director.groups.flatMap((group) => {
+    const model = new ModelRegistry(store).resolve(
+      run.projectId,
+      run.data.episodeId,
+      'video',
+      group.id,
+    );
+    return authoringExecutionIssues(
+      { ...director, groups: [group] },
+      model
+        ? {
+            provider: model.protocol,
+            minSeconds: model.capabilities.minSeconds!,
+            maxSeconds: model.capabilities.maxSeconds!,
+            framesPerSecond: 24,
+          }
+        : undefined,
+    );
+  });
   if (executionIssues.length)
     return updateRun(store, run, { issues: executionIssues, state: 'needs_revision' });
 
@@ -466,7 +487,7 @@ function materialize(store: Store, run: RecordDoc, results: Results) {
         notes: images.map((i) => bindings[i.id].conclusion).join('\n'),
       });
       pack = domain.publish(pack.id, pack.revision, {
-        inspected: true,
+        inspected: false,
         conclusion: images.map((i) => bindings[i.id].conclusion).join('\n'),
       });
       packs.set(subject.key, ref(pack));
@@ -486,14 +507,14 @@ function materialize(store: Store, run: RecordDoc, results: Results) {
             asset: ref(audio),
             in: 0,
             out: audio.data.duration,
-            inspected: true,
+            inspected: false,
             notes: bindings[item.id].conclusion,
           },
         ],
       };
       let voice = domain.save(run.projectId, 'voice_profile', data);
       voice = domain.publish(voice.id, voice.revision, {
-        inspected: true,
+        inspected: false,
         conclusion: bindings[item.id].conclusion,
       });
       voices.set(item.subjectKey, ref(voice));
@@ -532,7 +553,7 @@ function materialize(store: Store, run: RecordDoc, results: Results) {
         },
       });
       profile = domain.publish(profile.id, profile.revision, {
-        inspected: true,
+        inspected: false,
         conclusion: '由已采用呈现方向确定性映射；创作方案采用不表示媒体审核通过',
       });
       domain.dependencies(profile, [run.data.results.direction]);
@@ -553,11 +574,8 @@ function materialize(store: Store, run: RecordDoc, results: Results) {
           ),
       );
       const lines = s.dialogue.map(({ lineId: id }) => scene.dialogue.find((l) => l.id === id)!);
-      if (ep.data.seriesProduction && lines.some((l) => !voices.has(l.speakerKey)))
-        throw new HttpError(
-          409,
-          `镜头 ${s.id} 需要真实音色样本；请修订资产需求加入声音身份并导入听审，或绑定既有系列主体`,
-        );
+      // Native dialogue does not consume a voice sample. Fixed identity is checked
+      // by explicit speech/import preparation, rather than an unused sample gate.
       const keys = [
         ...new Set([
           ...s.visibleSubjectKeys,
@@ -696,33 +714,36 @@ function materialize(store: Store, run: RecordDoc, results: Results) {
           i.mediaType === 'image' &&
           (!i.shotIds.length || i.shotIds.some((id) => g.shotIds.includes(id))),
       );
-      const incoming: any = ep.data.seriesProduction
-        ? {
-            version: 2,
-            mode: continuous ? 'continue' : 'independent',
-            cut: continuous ? 'angle' : 'independent',
-            reason: g.reason,
-            awaiting: continuous
-              ? [{ episodeId: ep.id, segmentId: fullDirector.groups[index - 1].id }]
-              : [],
-          }
-        : {
-            version: 1,
-            mode: continuous ? 'continue' : 'independent',
-            ...(continuous
-              ? {
-                  awaiting: { episodeId: ep.id, segmentId: fullDirector.groups[index - 1].id },
-                  decisions: first.state
-                    .attributes!.start.filter((f) => f.status === 'known')
-                    .map((f) => ({ instanceId: f.instanceId, key: f.key, decision: 'inherit' })),
-                  relationDecisions: first.state.startRelations.map((r) => ({
-                    objectId: r.objectId,
-                    decision: 'inherit',
-                  })),
-                }
-              : {}),
-          };
-      if (ep.data.seriesProduction && index === 0 && g.transition === 'continuous') {
+      const override = scope?.data.continuations?.[g.id];
+      const incoming: any = override
+        ? structuredClone(override)
+        : ep.data.seriesProduction
+          ? {
+              version: 2,
+              mode: continuous ? 'continue' : 'independent',
+              cut: continuous ? 'angle' : 'independent',
+              reason: g.reason,
+              awaiting: continuous
+                ? [{ episodeId: ep.id, segmentId: fullDirector.groups[index - 1].id }]
+                : [],
+            }
+          : {
+              version: 1,
+              mode: continuous ? 'continue' : 'independent',
+              ...(continuous
+                ? {
+                    awaiting: { episodeId: ep.id, segmentId: fullDirector.groups[index - 1].id },
+                    decisions: first.state
+                      .attributes!.start.filter((f) => f.status === 'known')
+                      .map((f) => ({ instanceId: f.instanceId, key: f.key, decision: 'inherit' })),
+                    relationDecisions: first.state.startRelations.map((r) => ({
+                      objectId: r.objectId,
+                      decision: 'inherit',
+                    })),
+                  }
+                : {}),
+            };
+      if (!override && ep.data.seriesProduction && index === 0 && g.transition === 'continuous') {
         const prior = predecessorCanon(store, ep).canon;
         if (!prior)
           throw new HttpError(
@@ -767,7 +788,7 @@ function materialize(store: Store, run: RecordDoc, results: Results) {
     const seriesProduction = ep.data.seriesProduction
       ? {
           ...ep.data.seriesProduction,
-          ...(runtimeBounds
+          ...(!run.data.effectivePlan && runtimeBounds
             ? {
                 runtime: {
                   targetFrames: Math.round(run.data.duration.seconds * 24),
@@ -896,12 +917,12 @@ function materialize(store: Store, run: RecordDoc, results: Results) {
             coverage: (bindings[item.id].coverage || []).filter((c: any) =>
               segment.shotIds.includes(c.shotId),
             ),
-            reviewed: true,
+            reviewed: Boolean(bindings[item.id].inspected),
           },
         })),
       });
       plan = domain.publish(plan.id, plan.revision, {
-        inspected: true,
+        inspected: false,
         conclusion: segment.imageRequirements.map((i) => bindings[i.id].conclusion).join('\n'),
       });
       Object.assign(segment, {
@@ -946,6 +967,17 @@ export function prepareCreationProduction(
   previewOnly = false,
 ) {
   const scope = resolveScope(store, run);
+  if (run.data.productionRevision) {
+    const predecessor = episodePredecessor(store, store.get(run.data.episodeId));
+    if (predecessor.hypothetical)
+      return updateRun(store, run, {
+        state: 'awaiting_review',
+        issues: [issue('predecessor_waiting', predecessor.waiting!, '', 'evidence')],
+        productionPreview: null,
+        productionApproval: null,
+      });
+    assertEpisodePlanCurrent(store, run);
+  }
   const invalidations = (run.data.resultInvalidations || []).filter(
     (entry: any) =>
       !entry.shotIds.length || entry.shotIds.some((id: string) => scope.data.shotIds.includes(id)),
@@ -1007,7 +1039,7 @@ export function prepareCreationProduction(
     if (!run.data.materialized) return run;
   }
   let ep = store.get(run.data.episodeId);
-  if (ep.revision !== run.data.targetRevision || ep.data.stale || !ep.data.approved)
+  if (ep.revision !== run.data.targetRevision)
     throw new HttpError(409, '正式分集已改变，请在创作会话中明确重新读取与采用');
   const media = creationMediaStatus(store, run);
   const groups = media.groups.filter((g: any) => scope.data.groupIds.includes(g.id));
@@ -1116,8 +1148,28 @@ export function prepareCreationProduction(
         store.setting('comfy', null as any),
         ref(scope),
       );
-      prepared.push({
+      const p = preparation.input as any;
+      const ratio = p.prepared?.request?.ratio;
+      const firstBinding =
+        p.prepared?.inputBindings?.find((b: any) => b.role === 'first_frame') ||
+        p.prepared?.inputBindings?.[0];
+      const firstAsset = p.assets?.find((a: any) => a.asset.id === firstBinding?.asset.id)?.asset;
+      const size =
+        ratio && ratio !== 'adaptive'
+          ? ratio.split(':').map(Number)
+          : ratio === 'adaptive'
+            ? [firstAsset?.data.width, firstAsset?.data.height]
+            : [profile.width, profile.height];
+      const format = run.data.effectivePlan
+        ? formatComparison(run.data.effectivePlan, size[0], size[1])
+        : null;
+      if (format && (!size.every((v: number) => Number.isFinite(v) && v > 0) || !format.ready))
+        throw new HttpError(409, format.message);
+      const preparedInput = {
         ...preparation.input,
+        ...(run.data.effectivePlan
+          ? { effectivePlan: run.data.effectivePlan, formatComparison: format }
+          : {}),
         authoringVersion: 9,
         contractRevision: 2,
         authoring: scope.data.authoring,
@@ -1139,7 +1191,12 @@ export function prepareCreationProduction(
           results.assets?.stage === 'assets' ? results.assets.items : [],
           run.data.bindings,
         ),
-      });
+      };
+      prepared.push(
+        scope.data.experiment
+          ? bindExperimentInput(store, preparedInput, scope.data.experiment)
+          : preparedInput,
+      );
     } catch (e) {
       if (!(e instanceof HttpError || e instanceof z.ZodError)) throw e;
       issues.push(issue('execution_not_ready', e.message, group.id));

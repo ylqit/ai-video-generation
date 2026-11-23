@@ -1,3 +1,4 @@
+import { productionHead } from './creation-heads.js';
 import { DomainService } from './domain-service.js';
 import { AssemblyService } from './assembly.js';
 import { selectionMedia } from './selection-splice.js';
@@ -22,7 +23,7 @@ export function fixedSeriesRecord(
     head = store.get(ref.id);
   if (doc.projectId !== projectId || (kind && doc.kind !== kind))
     throw new HttpError(400, '系列依据归属或类型错误');
-  if (doc.data.stale || head.data.stale || doc.data.archived || head.data.archived)
+  if (doc.data.archived || head.data.archived)
     throw new HttpError(409, `固定依据待复核：${doc.id}`);
   return doc;
 }
@@ -138,14 +139,13 @@ export function resolveSeries(store: Store, target: any) {
   if (!series || series.kind !== 'series' || series.projectId !== target.projectId)
     throw new HttpError(400, 'V7 必须明确所属系列');
   const production = seriesProductionSchema.parse(series.data.production);
-  if (!series.data.approved || series.data.stale) throw new HttpError(409, '系列制作计划待确认');
   const profile = fixedSeriesRecord(
     store,
     series.projectId,
     production.profile,
     'creation_profile',
   );
-  if (profile.data.rulesVersion !== 'director-v7' || !profile.data.published)
+  if (profile.data.rulesVersion !== 'director-v7')
     throw new HttpError(409, '系列需要固定已发布的 V7 配置');
   const shared = production.sharedReferences.map((r) =>
     fixedSeriesRecord(store, series.projectId, r),
@@ -164,7 +164,6 @@ export function resolveSeries(store: Store, target: any) {
     bindings.set(v.instanceId, v.profile);
   const voices = [...bindings].map(([instanceId, ref]) => {
     const record = fixedSeriesRecord(store, series.projectId, ref, 'voice_profile');
-    if (!record.data.published) throw new HttpError(409, '系列声音版本需要先听审发布');
     const entity = fixedSeriesRecord(store, series.projectId, record.data.entity, 'entity');
     if (!entity.data.instances.some((i: any) => i.id === instanceId))
       throw new HttpError(400, '声音角色实例与主体不符');
@@ -199,48 +198,61 @@ export function episodeRuntime(store: Store, ep: any) {
     ep.data.seriesProduction.runtime || slot.runtime || production.runtime,
   );
 }
-export function predecessorCanon(store: Store, ep: any, allowMissing = false) {
+export function predecessorCanon(store: Store, ep: any, _allowMissing = false) {
   const { series, production } = resolveSeries(store, ep);
-  const slots = production.slots.filter((s) => s.active),
-    index = slots.findIndex((s) => s.id === ep.data.seriesProduction.slotId);
+  if (
+    (ep.data.seriesProduction.factDependency || production.factDependency)?.mode === 'independent'
+  )
+    return { canon: null as any, story: null as any, waiting: null as string | null };
+  const slots = production.slots.filter((s) => s.active);
+  const index = slots.findIndex((s) => s.id === ep.data.seriesProduction.slotId);
+  const priorId = index > 0 ? slots[index - 1].episodeId : null;
   let canon: any = null;
+  let story: any = null;
   if (index === 0 && production.chronology.fromCanon) {
-    try {
-      canon = fixedSeriesRecord(store, ep.projectId, production.chronology.fromCanon, 'continuity');
-      if (canonSourceProblems(store, canon).length)
-        throw new HttpError(409, '前作事实的实际证据需要复核');
-    } catch (e) {
-      if (allowMissing) return { canon: null, waiting: '固定前作事实未就绪或证据需要复核' };
-      throw e;
-    }
-  }
-  if (index > 0) {
-    const prior = slots[index - 1];
-    canon =
-      prior.episodeId &&
-      store
-        .list('continuity', ep.projectId)
-        .find((c) => c.parentId === prior.episodeId && c.data.seriesId === series.id);
-    if (
-      !canon ||
-      !canon.data.confirmed ||
-      canon.data.stale ||
-      canonSourceProblems(store, canon).length
-    ) {
-      if (allowMissing)
-        return { canon: null, waiting: `前置分集 ${prior.title || prior.id} 剧情未确认或待复核` };
-      throw new HttpError(
-        409,
-        `前置分集 ${prior.title || prior.id} 剧情未确认或待复核；不能回退读取更旧事实`,
+    canon = fixedSeriesRecord(store, ep.projectId, production.chronology.fromCanon, 'continuity');
+  } else if (priorId) {
+    canon = store
+      .list('continuity', ep.projectId)
+      .find(
+        (c) =>
+          c.parentId === priorId &&
+          c.data.seriesId === series.id &&
+          c.data.basis !== 'authored_story',
       );
+    story =
+      store
+        .list('continuity', ep.projectId, priorId)
+        .find((c) => c.data.basis === 'authored_story') || null;
+    const head = productionHead(store, priorId);
+    if (head.runId && !head.conflict) {
+      const source = store.get(head.runId).data.results?.script;
+      if (source && !story) story = store.get(source.id, source.revision);
+    }
+    if (!story) {
+      const chapters = store.list('chapter', ep.projectId, priorId);
+      if (chapters.length) story = { basis: 'authored_documents', documents: chapters };
     }
   }
-  if (canon && (!canon.data.confirmed || canon.data.stale || canon.data.schemaVersion !== 3)) {
-    if (allowMissing) return { canon: null, waiting: '前置事实需显式转换并审核为 Canon v3' };
-    throw new HttpError(409, '前置事实需显式转换并审核为 Canon v3');
-  }
-  return { canon, waiting: null };
+  // Do not fall back to an older episode. Missing media confirmation is descriptive,
+  // not a writing or generation gate; current authored text remains a distinct source.
+  if (
+    canon &&
+    (canon.data.stale ||
+      (canon.data.schemaVersion === 3 && canonSourceProblems(store, canon).length))
+  )
+    return {
+      canon: null,
+      story,
+      waiting: '前置媒体记录需要更新；可继续使用剧情正文，未核实内容保持未知',
+    };
+  return {
+    canon,
+    story,
+    waiting: index > 0 && !canon ? '前集尚无媒体观察；当前剧情正文可用于继续创作' : null,
+  };
 }
+
 export function seriesInformationForEpisode(store: Store, ep: any, requireConfirmed = false) {
   const { production } = resolveSeries(store, ep);
   const links = episodeProductionSchema.parse(ep.data.seriesProduction).information;
@@ -267,7 +279,7 @@ export function seriesInformationForEpisode(store: Store, ep: any, requireConfir
             ),
         )
       )
-        throw new HttpError(409, '跨集揭示的前置成片信息尚未确认');
+        return { ...entry, ...link, warning: '跨集揭示尚无前置媒体观察；当前可按剧情继续制作' };
     }
     return {
       ...entry,
@@ -469,6 +481,10 @@ export class SeriesProductionService {
     const series = this.store.get(seriesId),
       { production } = resolveSeries(this.store, series);
     const releases = this.store.list('episode_release', series.projectId);
+    const selections = this.store.list('segment_selection', series.projectId);
+    const canons = this.store
+      .list('continuity', series.projectId)
+      .filter((c) => c.data.seriesId === series.id);
     const jobs = this.store.jobs(series.projectId),
       edls = this.store.list('edl', series.projectId),
       takes = this.store.list('dialogue_take', series.projectId);
@@ -487,20 +503,7 @@ export class SeriesProductionService {
       const runtime = ep?.data.seriesProduction?.runtime || slot.runtime || production.runtime;
       const release = releases.filter((r) => r.parentId === slot.episodeId && !r.data.stale).at(-1);
       const fits =
-        release &&
-        Math.abs(release.data.frames - runtime.targetFrames) <= runtime.toleranceFrames &&
-        (() => {
-          try {
-            const c = this.store.get(release.data.canon.id);
-            return (
-              c.revision === release.data.canon.revision &&
-              !c.data.stale &&
-              !canonSourceProblems(this.store, c).length
-            );
-          } catch {
-            return false;
-          }
-        })();
+        release && Math.abs(release.data.frames - runtime.targetFrames) <= runtime.toleranceFrames;
       return {
         ...slot,
         runtime,
@@ -524,8 +527,7 @@ export class SeriesProductionService {
           !!assembly && assembly.scopes.length > 0 && assembly.scopes.every((s: any) => s.passed),
         assemblyProblem,
         adoptedFrames: ep
-          ? this.store
-              .list('segment_selection', series.projectId)
+          ? selections
               .filter((s) => s.parentId === ep.id && !s.data.stale)
               .reduce(
                 (n, s) =>
@@ -536,14 +538,12 @@ export class SeriesProductionService {
           : 0,
       };
     });
-    const confirmed = this.store
-      .list('continuity', series.projectId)
-      .filter(
-        (c) =>
-          c.data.seriesId === series.id &&
-          !c.data.stale &&
-          !canonSourceProblems(this.store, c).length,
-      );
+    const confirmed = canons.filter(
+      (c) =>
+        c.data.seriesId === series.id &&
+        !c.data.stale &&
+        !canonSourceProblems(this.store, c).length,
+    );
     const information = production.information.map((i) => ({
       ...i,
       actual: [
@@ -553,7 +553,7 @@ export class SeriesProductionService {
               (c.data.facts || [])
                 .filter(
                   (f: any) =>
-                    f.informationId === i.id && f.informationStage && f.source.kind === 'media',
+                    f.informationId === i.id && f.informationStage && f.source?.kind === 'media',
                 )
                 .map((f: any) => [
                   f.id,
@@ -577,8 +577,7 @@ export class SeriesProductionService {
       slots,
       delivered: slots.filter((s) => s.active && s.delivered).length,
       complete: slots.filter((s) => s.active && s.delivered).length === production.targetEpisodes,
-      facts: this.store
-        .list('continuity', series.projectId)
+      facts: canons
         .filter((c) => c.data.seriesId === series.id)
         .map((c) => ({
           id: c.id,

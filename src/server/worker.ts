@@ -1,9 +1,22 @@
+import { assertAssistantMaySubmit } from './assistant-usage.js';
+import { attachCanvasResults } from './canvas-results.js';
+import { executeMediaOperation } from './node-media-worker.js';
+import { executeNodeAnalysis } from './node-analysis-worker.js';
+import { renderDirectorJob } from './director-render-job.js';
+import { attachConversationResult } from './canvas-conversation.js';
+import { ProductionAssistant } from './production-assistant.js';
+import { executeSpeechJob } from './speech-worker.js';
+import { voiceHandleIdentity } from '../shared/speech.js';
+import { SeriesProposals } from './series-proposal.js';
+import { modelAvailable } from '../shared/models.js';
+import { archiveVideoCandidate } from './candidate-archive.js';
+import { executeProviderMedia } from './provider-media.js';
+import { runTextModel } from './text-model.js';
+import { resolveCredential } from './model-credentials.js';
+import { ModelHttpError } from './model-http.js';
 import fs from 'node:fs/promises';
-import { createWriteStream } from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { Readable, Transform } from 'node:stream';
-import { pipeline } from 'node:stream/promises';
 import { Store, HttpError } from './db.js';
 import { CreationMediaService } from './creation-media.js';
 import { CreationService } from './creation.js';
@@ -11,7 +24,7 @@ import { ComfyClient, compileH3 } from './comfy.js';
 import { inside } from './config.js';
 import { runCodex } from './codex.js';
 import { generationDigest, guidedTemplateVersion } from './h3-guided.js';
-import { ingestAsset, probeMedia, extractOriginalAudio, exportMovie, hashFile } from './media.js';
+import { ingestAsset, exportMovie, hashFile } from './media.js';
 import type { Job } from '../shared/contracts.js';
 import type WebSocket from 'ws';
 import { generationDependencies, correctionAffectsInput } from './generation-dependencies.js';
@@ -34,6 +47,7 @@ export class Worker {
     public makeClient = (url: string) => new ComfyClient(url),
     public runCreative = runCodex,
     public exportMedia = exportMovie,
+    public requestModel: typeof fetch = fetch,
   ) {}
   async tick(wait = true) {
     if (this.stopped) return;
@@ -54,6 +68,12 @@ export class Worker {
     this.store.writeLeaseOwner = this.owner;
     if (!this.initialized) {
       this.store.recover();
+      for (const row of this.store.db
+        .prepare(
+          "SELECT id FROM jobs WHERE state IN ('succeeded','failed','unknown') AND json_extract(input,'$.canvas.id') IS NOT NULL",
+        )
+        .all())
+        this.reconcileCanvas(String(row.id));
       this.initialized = true;
     }
     if (!this.heartbeat) {
@@ -63,7 +83,7 @@ export class Worker {
           return;
         }
         for (const [id, execution] of this.executions)
-          if (this.store.job(id).cancelRequested && execution.lane === 'creative')
+          if (this.store.job(id).cancelRequested && this.store.job(id).kind === 'creative')
             execution.controller.abort();
       }, 2000);
       this.heartbeat.unref();
@@ -73,10 +93,16 @@ export class Worker {
       .list('creation_run')
       .filter((r) => !r.data.paused && r.data.state !== 'complete'))
       creation.advance(run.id);
+    const assistant = new ProductionAssistant(this.store, this.root);
+    for (const run of this.store
+      .list('assistant_run')
+      .filter((r) => !['completed', 'stopped', 'paused'].includes(r.data.state)))
+      await assistant.advance(run.id);
     const jobs = this.store.db
       .prepare(
         `SELECT j.id,j.project_id,j.episode_id,j.kind,j.state,j.prompt_id,j.error,j.cancel_requested,j.created_at,j.updated_at,j.batch_id,j.batch_item_id,j.hold_reason,
           json_object('dependencies',json_extract(j.input,'$.dependencies'),
+            'voice',json_object('id',json_extract(j.input,'$.voice.id')),'modelExecution',json_extract(j.input,'$.modelExecution'),'profile',json_extract(j.input,'$.profile'),
             'segment',json_object('id',json_extract(j.input,'$.segment.id'),'incoming',json_extract(j.input,'$.segment.incoming'),'repair',json_extract(j.input,'$.segment.repair')),
             'episode',json_extract(j.input,'$.episode'),
             'assets',(SELECT json_group_array(json_object('asset',json_object('id',json_extract(value,'$.asset.id'),'revision',json_extract(value,'$.asset.revision')))) FROM json_each(j.input,'$.assets')),
@@ -110,7 +136,42 @@ export class Worker {
     }
     const free = (lane: string) => ![...this.executions.values()].some((e) => e.lane === lane);
     const available = (j: Job) => !this.executions.has(j.id) && !j.holdReason && !j.cancelRequested;
-    const generationJobs = jobs.filter((j) => j.kind === 'generation');
+    const generationJobs = jobs.filter((j) => j.kind === 'generation' || j.kind === 'image');
+    for (const job of jobs.filter((j) => j.state === 'queued' && j.input.modelExecution)) {
+      const connection = this.store.db
+        .prepare('SELECT data FROM model_connections WHERE id=?')
+        .get(job.input.modelExecution.connection.id);
+      const enabled =
+        connection &&
+        modelAvailable(JSON.parse(String(connection.data)), job.input.modelExecution.modelId);
+      if (!enabled && !job.holdReason) {
+        this.store.patchJob(job.id, { holdReason: 'model_connection_disabled' });
+        job.holdReason = 'model_connection_disabled';
+      }
+      if (enabled && job.holdReason === 'model_connection_disabled') {
+        this.store.patchJob(job.id, { holdReason: null });
+        job.holdReason = null;
+      }
+      if (job.input.voice && job.holdReason === 'voice_disabled') {
+        const voice = this.store.db
+          .prepare('SELECT enabled FROM library_metadata WHERE id=?')
+          .get(job.input.voice.id);
+        if (voice?.enabled) {
+          this.store.patchJob(job.id, { holdReason: null });
+          job.holdReason = null;
+        }
+      }
+      if (job.input.voice && job.holdReason === 'voice_unavailable') {
+        const status = this.store.setting<any>(
+          `voice_probe:${generationDigest(voiceHandleIdentity(job.input.voice.data.handle))}`,
+          null,
+        );
+        if (status?.state === 'ready' && (!status.expiresAt || status.expiresAt > Date.now())) {
+          this.store.patchJob(job.id, { holdReason: null });
+          job.holdReason = null;
+        }
+      }
+    }
     const corrections = generationJobs.length
       ? this.store.db
           .prepare(
@@ -156,21 +217,29 @@ export class Worker {
           console.error('Worker 执行状态提交失败：', error);
           this.stop();
         })
-        .finally(() => this.executions.delete(job.id));
+        .finally(() => {
+          this.executions.delete(job.id);
+          this.reconcileCanvas(job.id);
+        });
       this.executions.set(job.id, { lane, controller, promise });
     };
     start(
-      jobs.find((j) => j.kind === 'creative' && j.state === 'queued' && available(j)),
+      jobs.find(
+        (j) =>
+          j.kind === 'creative' && !j.input.modelExecution && j.state === 'queued' && available(j),
+      ),
       'creative',
     );
     const unresolved = jobs.find(
       (j) =>
         j.kind === 'generation' &&
+        !j.input.modelExecution &&
         ['submitted', 'running', 'unknown', 'submitting', 'preparing'].includes(j.state),
     );
     const queued = jobs.filter(
       (j) =>
         j.kind === 'generation' &&
+        !j.input.modelExecution &&
         j.state === 'queued' &&
         available(j) &&
         !this.store.job(j.id).holdReason,
@@ -178,14 +247,80 @@ export class Worker {
     const projects = [...new Set(queued.map((j) => j.projectId))];
     const nextProject = projects[(projects.indexOf(this.lastProject || '') + 1) % projects.length];
     const next = unresolved || queued.find((j) => j.projectId === nextProject);
-    if (next && free('remote') && !this.executions.has(next.id)) {
+    const explicitOnSameInstance =
+      next &&
+      jobs.some(
+        (j) =>
+          j.input.modelExecution?.protocol === 'comfy-h3' &&
+          j.input.profile?.instanceId === next.input.profile?.instanceId &&
+          !['queued', 'archiving', 'failed', 'succeeded', 'cancelled'].includes(j.state),
+      );
+    if (
+      next &&
+      (!explicitOnSameInstance || unresolved) &&
+      free('remote') &&
+      !this.executions.has(next.id)
+    ) {
       if (next.state === 'queued') this.lastProject = next.projectId;
       start(next, 'remote');
     }
+    const modelGroups = new Map<string, Job[]>();
+    for (const job of jobs.filter(
+      (j) =>
+        j.input.modelExecution &&
+        !['archiving', 'failed', 'succeeded', 'cancelled'].includes(j.state),
+    )) {
+      const key = job.input.modelExecution.connection.data.capacityGroup;
+      const members = modelGroups.get(key) || [];
+      members.push(job);
+      modelGroups.set(key, members);
+    }
+    for (const [group, members] of modelGroups) {
+      const limit = Math.min(
+        ...members.map((j) => j.input.modelExecution.connection.data.concurrency),
+      );
+      const sharedLegacy = unresolved || (next && this.executions.has(next.id) ? next : null);
+      const capacity =
+        limit -
+        (sharedLegacy &&
+        members.some(
+          (j) =>
+            j.input.modelExecution.protocol === 'comfy-h3' &&
+            j.input.profile?.instanceId === sharedLegacy.input.profile?.instanceId,
+        )
+          ? 1
+          : 0);
+      const running = members.filter((j) => j.state !== 'queued');
+      const waiting = members.filter(
+        (j) => j.state === 'queued' && available(j) && !this.store.job(j.id).holdReason,
+      );
+      for (let slot = 0; slot < Math.max(capacity, running.length); slot++)
+        start(
+          running[slot] || (slot < capacity ? waiting[slot - running.length] : undefined),
+          `model:${group}:${slot}`,
+        );
+    }
     start(
       jobs.find(
-        (j) => j.kind === 'generation' && j.state === 'archiving' && !this.executions.has(j.id),
-      ) || jobs.find((j) => j.kind === 'export' && j.state === 'queued' && available(j)),
+        (j) =>
+          [
+            'generation',
+            'image',
+            'voice_clone',
+            'speech',
+            'lipsync',
+            'media_analysis',
+            'transcription',
+          ].includes(j.kind) &&
+          j.state === 'archiving' &&
+          !this.executions.has(j.id),
+      ) ||
+        jobs.find(
+          (j) =>
+            ['export', 'media_process', 'previs'].includes(j.kind) &&
+            j.state === 'queued' &&
+            available(j),
+        ),
       'media',
     );
     if (wait) {
@@ -193,7 +328,19 @@ export class Worker {
       // Compatibility for direct tick callers: finish the newly discovered archive.
       const archive = this.store
         .jobs()
-        .find((j) => j.state === 'archiving' && j.kind === 'generation');
+        .find(
+          (j) =>
+            j.state === 'archiving' &&
+            [
+              'generation',
+              'image',
+              'voice_clone',
+              'speech',
+              'lipsync',
+              'media_analysis',
+              'transcription',
+            ].includes(j.kind),
+        );
       if (archive && free('media')) {
         start(archive, 'media');
         await Promise.all([...this.executions.values()].map((e) => e.promise));
@@ -202,9 +349,69 @@ export class Worker {
       this.heartbeat = null;
     }
   }
+  // Archival is complete even if linking a result to its workspace needs recovery.
+  reconcileCanvas(jobId: string) {
+    if (this.stopped) return;
+    try {
+      attachCanvasResults(this.store, jobId);
+      attachConversationResult(this.store, jobId);
+      const job = this.store.job(jobId);
+      if (job.output.canvasSyncError)
+        this.store.patchJob(jobId, { output: { ...job.output, canvasSyncError: null } });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error('画布结果回填待恢复：', jobId, message);
+      const job = this.store.job(jobId);
+      this.store.patchJob(jobId, { output: { ...job.output, canvasSyncError: message } });
+    }
+  }
   async execute(job: Job, lane: string, signal: AbortSignal) {
     try {
-      if (job.kind === 'generation') {
+      if (job.kind === 'media_process') {
+        await executeMediaOperation(this.store, this.root, job, signal);
+        return;
+      }
+      if (job.kind === 'previs') {
+        await renderDirectorJob(this.store, this.root, job, signal);
+        return;
+      }
+      if (['media_analysis', 'transcription'].includes(job.kind)) {
+        await executeNodeAnalysis(
+          this.store,
+          this.root,
+          job,
+          signal,
+          this.requestModel,
+          this.runCreative,
+        );
+        return;
+      }
+      if (['voice_clone', 'speech', 'lipsync'].includes(job.kind)) {
+        await executeSpeechJob(this.store, this.root, job, signal, this.requestModel);
+        return;
+      }
+      if (!job.projectId) throw new Error('项目任务缺少归属');
+      if (
+        job.state === 'queued' &&
+        job.input.creationRunId &&
+        this.store.get(job.input.creationRunId).data.schemaVersion !== 9
+      )
+        throw new Error('当前程序仅支持 V9 生产；尚未调用模型');
+      if (
+        job.kind === 'image' ||
+        (job.kind === 'generation' &&
+          job.input.modelExecution &&
+          job.input.modelExecution.protocol !== 'comfy-h3')
+      ) {
+        await executeProviderMedia(
+          this.store,
+          this.root,
+          job,
+          this.owner,
+          signal,
+          this.requestModel,
+        );
+      } else if (job.kind === 'generation') {
         if (
           ['queued', 'preparing'].includes(job.state) &&
           job.input.creationRunId &&
@@ -219,17 +426,106 @@ export class Worker {
           throw new Error(
             'Obsolete creative protocol; start a current authoring or discussion task',
           );
-        this.store.patchJob(job.id, { state: 'running', error: null });
-        const executionDir = inside(this.root, `jobs/${job.id}/runs/${this.owner}`);
+        const apiText = job.input.modelExecution && job.input.modelExecution.protocol !== 'codex';
+        const unknown = job.state === 'unknown';
+        if (unknown && !apiText) return;
+        this.store.patchJob(job.id, {
+          state: apiText ? (unknown ? 'unknown' : 'preparing') : 'running',
+          error: null,
+        });
+        const executionDir =
+          (job.input.modelExecution && job.output.executionDir) ||
+          inside(this.root, `jobs/${job.id}/runs/${this.owner}`);
         this.store.patchJob(job.id, { output: { ...job.output, executionDir } });
-        const proposal = await this.runCreative(job.input.context, executionDir, signal);
+        let proposal;
+        if (apiText) {
+          const result = await runTextModel(
+            this.store,
+            job.input.context,
+            executionDir,
+            signal,
+            this.requestModel,
+            unknown,
+            () => {
+              signal.throwIfAborted();
+              assertAssistantMaySubmit(this.store, job);
+              if (this.store.job(job.id).cancelRequested) throw new HttpError(409, '提交前已取消');
+              const enabled = this.store.db
+                .prepare('SELECT data FROM model_connections WHERE id=?')
+                .get(job.input.modelExecution.connection.id);
+              if (
+                !enabled ||
+                !modelAvailable(JSON.parse(String(enabled.data)), job.input.modelExecution.modelId)
+              ) {
+                this.store.patchJob(job.id, {
+                  state: 'queued',
+                  holdReason: 'model_connection_disabled',
+                });
+                throw new HttpError(409, '提交前连接已停用');
+              }
+              this.store.patchJob(job.id, { state: 'submitting' });
+            },
+            this.root,
+          );
+          proposal = result.result;
+          this.store.patchJob(job.id, {
+            state: 'running',
+            output: {
+              ...this.store.job(job.id).output,
+              providerReceipt: result.receipt,
+              descriptor: { textResponseFile: path.join(executionDir, 'response.json') },
+            },
+          });
+        } else {
+          const secret = job.input.modelExecution
+            ? await resolveCredential(
+                this.store,
+                job.input.modelExecution.connection.data.credential,
+              )
+            : null;
+          if (job.input.modelExecution) {
+            signal.throwIfAborted();
+            assertAssistantMaySubmit(this.store, job);
+            if (this.store.job(job.id).cancelRequested) throw new HttpError(409, '提交前已取消');
+            const currentConnection = this.store.db
+              .prepare('SELECT data FROM model_connections WHERE id=?')
+              .get(job.input.modelExecution.connection.id);
+            if (
+              !currentConnection ||
+              !modelAvailable(
+                JSON.parse(String(currentConnection.data)),
+                job.input.modelExecution.modelId,
+              )
+            ) {
+              this.store.patchJob(job.id, {
+                state: 'queued',
+                holdReason: 'model_connection_disabled',
+              });
+              return;
+            }
+          }
+          proposal = await this.runCreative(
+            job.input.context,
+            executionDir,
+            signal,
+            secret ? { ...process.env, STUDIO_TASK_API_KEY: secret } : undefined,
+          );
+        }
         signal.throwIfAborted();
+        const assistant = job.input.context.mode === 'assistant';
+        const season = job.input.context.mode === 'series_proposal';
         const discussion = job.input.context.mode === 'discussion';
-        const doc = discussion
-          ? new CreationMediaService(this.store, this.root).completeDiscussion(job, proposal)
-          : new CreationService(this.store).complete(job, proposal);
+        const doc = season
+          ? new SeriesProposals(this.store).complete(job, proposal)
+          : assistant
+            ? new ProductionAssistant(this.store, this.root).completeDecision(job, proposal)
+            : discussion
+              ? new CreationMediaService(this.store, this.root).completeDiscussion(job, proposal)
+              : new CreationService(this.store).complete(job, proposal);
         if (
           !discussion &&
+          !assistant &&
+          !season &&
           !this.store
             .list('creation_message', job.projectId)
             .some((m) => m.data.role === 'assistant' && m.data.jobId === job.id)
@@ -259,7 +555,13 @@ export class Worker {
           state: 'succeeded',
           output: {
             ...this.store.job(job.id).output,
-            ...(discussion ? { messageId: doc.id } : { authoringResultId: doc.id }),
+            ...(season
+              ? { seriesProposalId: doc.id }
+              : assistant
+                ? { assistantRunId: doc.id }
+                : discussion
+                  ? { messageId: doc.id }
+                  : { authoringResultId: doc.id }),
           },
           error: null,
         });
@@ -283,7 +585,7 @@ export class Worker {
         const dir = inside(this.root, `jobs/${job.id}/runs/${this.owner}`);
         await fs.mkdir(dir, { recursive: true });
         const output = path.join(dir, 'export.mp4');
-        if (job.input.purpose === 'candidate_review' || job.input.deliveryPlan)
+        if (job.input.canvas || job.input.purpose === 'candidate_review' || job.input.deliveryPlan)
           for (const source of job.input.assets) {
             signal.throwIfAborted();
             if ((await hashFile(inside(this.root, source.data.path))) !== source.data.sha256)
@@ -324,11 +626,55 @@ export class Worker {
     } catch (e: any) {
       const current = this.store.job(job.id);
       if (current.output.waitSuspended) return;
+      if (current.state === 'queued' && current.holdReason) return;
       const networkStage =
-        job.kind === 'generation' && ['unknown', 'submitted', 'running'].includes(current.state);
+        ['generation', 'image', 'creative', 'voice_clone', 'speech', 'lipsync'].includes(
+          job.kind,
+        ) &&
+        [
+          'unknown',
+          'submitted',
+          ...(['generation', 'voice_clone', 'speech', 'lipsync'].includes(job.kind)
+            ? ['running']
+            : []),
+        ].includes(current.state);
       if (this.stopped) return;
+      if (
+        job.kind === 'creative' &&
+        job.input.modelExecution &&
+        ['submitting', 'unknown'].includes(current.state) &&
+        current.output.executionDir
+      ) {
+        const responseFile = path.join(current.output.executionDir, 'response.json');
+        if (
+          await fs.access(responseFile).then(
+            () => true,
+            () => false,
+          )
+        ) {
+          this.store.patchJob(job.id, {
+            state: 'failed',
+            output: { ...current.output, descriptor: { textResponseFile: responseFile } },
+            error: e.message || String(e),
+          });
+          return;
+        }
+      }
+      const rejected =
+        (e instanceof ModelHttpError ||
+          (['voice_clone', 'speech', 'lipsync'].includes(job.kind) && e instanceof HttpError)) &&
+        [400, 401, 402, 403, 404, 413, 422, 429].includes(e.status);
       this.store.patchJob(job.id, {
-        state: networkStage ? current.state : current.cancelRequested ? 'cancelled' : 'failed',
+        state:
+          rejected && current.state === 'submitting'
+            ? 'failed'
+            : job.input.modelExecution && current.state === 'submitting'
+              ? 'unknown'
+              : networkStage
+                ? current.state
+                : current.cancelRequested
+                  ? 'cancelled'
+                  : 'failed',
         error: e.message || String(e),
       });
     }
@@ -376,6 +722,22 @@ export class Worker {
         this.store.patchJob(job.id, { state: 'cancelled' });
         return;
       }
+      if (job.input.modelExecution) {
+        const currentConnection = this.store.db
+          .prepare('SELECT data FROM model_connections WHERE id=?')
+          .get(job.input.modelExecution.connection.id);
+        if (
+          !currentConnection ||
+          !modelAvailable(
+            JSON.parse(String(currentConnection.data)),
+            job.input.modelExecution.modelId,
+          )
+        ) {
+          this.store.patchJob(job.id, { state: 'queued', holdReason: 'model_connection_disabled' });
+          return;
+        }
+      }
+      assertAssistantMaySubmit(this.store, job);
       this.store.patchJob(job.id, {
         state: 'submitting',
         output: { receipts, graph, executionDir: dir },
@@ -516,105 +878,22 @@ export class Worker {
     }
   }
   async archive(job: Job, client: ComfyClient, signal?: AbortSignal) {
-    const dir = inside(this.root, `jobs/${job.id}/runs/${this.owner}`);
-    await fs.mkdir(dir, { recursive: true });
-    const file = path.join(dir, 'result.mp4');
-    let video = job.output.videoAssetId
-      ? this.store.get(job.output.videoAssetId)
-      : this.store
-          .list('asset', job.projectId)
-          .find((a) => a.data.jobId === job.id && a.data.category === 'generated');
-    if (!video) {
-      const d = job.output.descriptor;
-      const params = new URLSearchParams({
-        filename: d.filename,
-        subfolder: d.subfolder || '',
-        type: d.type || 'output',
-      });
-      const response = await client.request('/view?' + params, {}, 120000);
-      if (!response.body) throw new Error('视频下载没有响应体');
-      let bytes = 0;
-      const limit = new Transform({
-        transform(chunk, _encoding, done) {
-          bytes += chunk.length;
-          if (bytes > 512 * 1024 * 1024) done(new Error('视频超过 512 MB 下载限制'));
-          else done(null, chunk);
-        },
-      });
-      const partial = file + '.part';
-      await pipeline(Readable.fromWeb(response.body as any), limit, createWriteStream(partial), {
-        signal,
-      });
-      signal?.throwIfAborted();
-      await fs.rename(partial, file);
-      const info = await probeMedia(file);
-      if (info.mediaType !== 'video' || !info.duration) throw new Error('输出不是有效视频');
-      video = await ingestAsset(this.store, this.root, job.projectId, file, {
-        name: `${job.input.segment.id} · 候选`,
-        category: 'generated',
-        jobId: job.id,
-        episodeId: job.episodeId,
-        prompt: job.input.prepared?.finalPrompt || job.input.segment.prompt,
-        sourceAssetIds: job.input.assets.map((a: any) => a.asset.id),
-      });
-    }
-    this.store.patchJob(job.id, {
-      output: { ...this.store.job(job.id).output, videoAssetId: video.id },
-    });
-    const existing = this.store.list('asset', job.projectId).filter((a) => a.data.jobId === job.id);
-    const last = existing.find((a) => a.data.category === 'keyframe');
-    let audio = existing.find((a) => a.data.category === 'original_audio');
-    if (video.data.hasAudio && !audio) {
-      const file = await extractOriginalAudio(inside(this.root, video.data.path), dir, signal);
-      audio = await ingestAsset(this.store, this.root, job.projectId, file, {
-        name: '原始音轨',
-        category: 'original_audio',
-        jobId: job.id,
-        episodeId: job.episodeId,
-        sourceAssetIds: [video.id],
-        derivedSource: {
-          jobId: job.id,
-          media: { id: video.id, revision: video.revision },
-          kind: 'audio',
-          frameIndex: null,
-          interval: null,
-          parameters: { codec: 'pcm_s16le' },
-        },
-      });
-      await fs
-        .unlink(file)
-        .catch((e) => this.store.event(job.id, 'media_cleanup_warning', { error: e.message }));
-    }
-    const metadata = await probeMedia(inside(this.root, video.data.path));
-    const reviewFrames = this.store.job(job.id).output.reviewFrames;
-    this.store.patchJob(job.id, {
-      output: {
-        ...this.store.job(job.id).output,
-        mediaCheck: {
-          frameCount: metadata.frameCount,
-          duration: metadata.duration,
-          width: metadata.width,
-          height: metadata.height,
-          expectedFrameCount: job.input.prepared?.frameCount,
-          frameCountMatches: metadata.frameCount === job.input.prepared?.frameCount,
-          streams: metadata.streams,
-          visualReview: 'pending',
-        },
+    await archiveVideoCandidate(
+      this.store,
+      this.root,
+      job,
+      this.owner,
+      () => {
+        const d = job.output.descriptor;
+        const params = new URLSearchParams({
+          filename: d.filename,
+          subfolder: d.subfolder || '',
+          type: d.type || 'output',
+        });
+        return client.request('/view?' + params, {}, 120000);
       },
-    });
-    this.store.patchJob(job.id, {
-      state: this.store.job(job.id).cancelRequested ? 'cancelled' : 'succeeded',
-      output: {
-        ...this.store.job(job.id).output,
-        assetIds: [
-          video.id,
-          ...(last ? [last.id] : []),
-          ...(audio ? [audio.id] : []),
-          ...(reviewFrames || []).map((f: any) => f.assetId),
-        ],
-      },
-      error: null,
-    });
+      signal,
+    );
   }
   stop() {
     this.stopped = true;

@@ -43,13 +43,46 @@ CREATE TABLE events(seq INTEGER PRIMARY KEY AUTOINCREMENT,job_id TEXT,kind TEXT 
 CREATE TABLE settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
 CREATE TABLE leases(name TEXT PRIMARY KEY,owner TEXT NOT NULL,expires INTEGER NOT NULL);`;
 
+const modelTables = `
+CREATE TABLE model_connections(id TEXT PRIMARY KEY,revision INTEGER NOT NULL,data TEXT NOT NULL,created_at INTEGER NOT NULL);
+CREATE TABLE model_connection_versions(id TEXT NOT NULL,revision INTEGER NOT NULL,data TEXT NOT NULL,created_at INTEGER NOT NULL,PRIMARY KEY(id,revision));
+CREATE TABLE model_secrets(id TEXT PRIMARY KEY,protected_value TEXT NOT NULL,created_at INTEGER NOT NULL);
+CREATE UNIQUE INDEX model_config_owner ON documents(project_id,parent_id) WHERE kind='model_execution_config';
+`;
+
+// Explicit, additive upgrade. Ordinary startup never mutates a v4 workspace.
+export function upgradeModelDatabase(db: DatabaseSync) {
+  if (Number(db.prepare('PRAGMA user_version').get()?.user_version) !== 4)
+    throw new Error('模型迁移仅接受 v4 数据库');
+  assertCurrentWorkspace(db, 4);
+  if (db.prepare('SELECT name FROM leases WHERE expires>?').get(Date.now()))
+    throw new Error('Worker 租约仍有效，请停止服务后迁移');
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    db.exec(modelTables + 'PRAGMA user_version=5;');
+    assertCurrentWorkspace(db, 5);
+    db.exec('COMMIT');
+  } catch (error) {
+    db.exec('ROLLBACK');
+    throw error;
+  }
+}
+
 // This production release accepts only an empty database or the current V9 workspace.
 // Historical databases must be opened with their matching offline program backup.
 export function migrateDatabase(db: DatabaseSync) {
   db.exec('BEGIN IMMEDIATE');
   try {
     const version = Number(db.prepare('PRAGMA user_version').get()?.user_version);
-    if (version > 4) throw new Error('数据库来自更新版本，拒绝降级打开');
+    if (version > 6) throw new Error('数据库来自更新版本，拒绝降级打开');
+    if (version === 5)
+      throw new Error(
+        '数据库 v5 需要显式声音迁移：备份并停止服务后运行 migrate:voices；未修改数据',
+      );
+    if (version === 4)
+      throw new Error(
+        '数据库 v4 需要显式模型迁移：备份并停止服务后运行 migrate:models；未修改数据',
+      );
     if (version > 0 && version < 4)
       throw new Error('不支持旧数据库，请使用新的空数据目录；旧库只能用匹配的备份程序离线打开');
     if (version === 0) {
@@ -61,8 +94,10 @@ export function migrateDatabase(db: DatabaseSync) {
         CREATE INDEX documents_job ON documents(project_id,kind,json_extract(data,'$.jobId'));
         CREATE INDEX documents_parent ON documents(project_id,kind,parent_id,created_at,id);
         CREATE INDEX jobs_creation ON jobs(project_id,json_extract(input,'$.creationRunId'),created_at);
-        PRAGMA user_version=4;
+        ${modelTables}
+        PRAGMA user_version=5;
       `);
+      db.exec(voiceTables);
     }
     assertCurrentWorkspace(db);
     db.exec('COMMIT');
@@ -73,8 +108,8 @@ export function migrateDatabase(db: DatabaseSync) {
 }
 
 // Shared read-only boundary for startup and offline project retention.
-export function assertCurrentWorkspace(db: DatabaseSync) {
-  if (Number(db.prepare('PRAGMA user_version').get()?.user_version) !== 4)
+export function assertCurrentWorkspace(db: DatabaseSync, expectedVersion = 6) {
+  if (Number(db.prepare('PRAGMA user_version').get()?.user_version) !== expectedVersion)
     throw new Error('不支持旧数据库，请使用匹配的离线备份程序');
   const legacy = db
     .prepare(
@@ -95,4 +130,38 @@ export function assertCurrentWorkspace(db: DatabaseSync) {
     )
     .get();
   if (legacy) throw new Error('活动库含旧作者协议；请保留离线备份并建立新的 V9 空库');
+}
+
+// Global jobs have a NULL project, never a synthetic project document. Rebuild retains all
+// frozen JSON, IDs and timestamps; all changes are in the explicit migration transaction.
+const voiceTables = `
+CREATE TABLE voice_folders(id TEXT PRIMARY KEY,parent_id TEXT REFERENCES voice_folders(id),name TEXT NOT NULL,revision INTEGER NOT NULL);
+CREATE TABLE library_metadata(id TEXT PRIMARY KEY REFERENCES library_items(id),kind TEXT NOT NULL,folder_id TEXT REFERENCES voice_folders(id),enabled INTEGER NOT NULL DEFAULT 1,favorite INTEGER NOT NULL DEFAULT 0,revision INTEGER NOT NULL DEFAULT 1);
+CREATE INDEX library_folder ON library_metadata(kind,folder_id,id);
+ALTER TABLE jobs RENAME TO jobs_v5;
+CREATE TABLE jobs(id TEXT PRIMARY KEY,project_id TEXT,episode_id TEXT,kind TEXT NOT NULL,state TEXT NOT NULL,input TEXT NOT NULL,output TEXT NOT NULL DEFAULT '{}',prompt_id TEXT,error TEXT,cancel_requested INTEGER NOT NULL DEFAULT 0,idempotency_key TEXT NOT NULL UNIQUE,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,batch_id TEXT,batch_item_id TEXT,hold_reason TEXT,
+  CHECK(project_id IS NOT NULL OR (kind IN ('voice_clone','speech') AND episode_id IS NULL)));
+INSERT INTO jobs SELECT * FROM jobs_v5;
+DROP TABLE jobs_v5;
+CREATE UNIQUE INDEX jobs_batch_item ON jobs(batch_id,batch_item_id) WHERE batch_id IS NOT NULL;
+CREATE INDEX jobs_lookup ON jobs(project_id,state,created_at);
+CREATE INDEX jobs_creation ON jobs(project_id,json_extract(input,'$.creationRunId'),created_at);
+CREATE INDEX jobs_operation ON jobs(kind,state,created_at);
+CREATE INDEX events_job_stage ON events(job_id,kind,created_at);
+PRAGMA user_version=6;
+`;
+
+export function upgradeVoiceDatabase(db: DatabaseSync) {
+  assertCurrentWorkspace(db, 5);
+  if (db.prepare('SELECT name FROM leases WHERE expires>?').get(Date.now()))
+    throw new Error('Worker 租约仍有效，请停止服务后迁移');
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    db.exec(voiceTables);
+    assertCurrentWorkspace(db);
+    db.exec('COMMIT');
+  } catch (error) {
+    db.exec('ROLLBACK');
+    throw error;
+  }
 }

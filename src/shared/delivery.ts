@@ -31,9 +31,9 @@ export const deliveryConfirmSchema = z
     revision: z.number().int().positive(),
     planRef: creationRefSchema.optional(),
     exportAsset: creationRefSchema,
-    watched: z.literal(true),
-    listened: z.literal(true),
-    conclusion: z.string().trim().min(1),
+    watched: z.boolean().default(false),
+    listened: z.boolean().default(false),
+    conclusion: z.string().trim().default(''),
     idempotencyKey: z.string().min(8),
     canon: z.unknown().optional(),
   })

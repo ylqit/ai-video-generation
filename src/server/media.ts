@@ -26,6 +26,7 @@ export function runProcess(
     signal?: AbortSignal;
     timeout?: number;
     onLine?: (text: string) => void;
+    env?: NodeJS.ProcessEnv;
   } = {},
 ) {
   return new Promise<string>((resolve, reject) => {
@@ -34,6 +35,7 @@ export function runProcess(
       windowsHide: true,
       stdio: ['pipe', 'pipe', 'pipe'],
       signal: options.signal,
+      env: options.env,
     });
     let stdout = '',
       stderr = '';
@@ -78,6 +80,10 @@ export async function probeMedia(file: string) {
   const audio = data.streams?.find((s: any) => s.codec_type === 'audio');
   if (!video && !audio) throw new HttpError(400, '不是支持的图片、视频或音频');
   const image = /\.(png|jpe?g|webp)$/i.test(file);
+  if (video && (!(video.width > 0) || !(video.height > 0)))
+    throw new HttpError(400, '图片或视频无法解析有效尺寸，文件可能损坏');
+  if (!image && !(Number(data.format?.duration) > 0))
+    throw new HttpError(400, '影音文件缺少有效时长');
   return {
     mediaType: (image ? 'image' : video ? 'video' : 'audio') as 'image' | 'video' | 'audio',
     duration: Number(data.format?.duration) || 0,
@@ -90,12 +96,24 @@ export async function probeMedia(file: string) {
       codec: s.codec_name,
       frameRate: s.avg_frame_rate,
       sampleRate: s.sample_rate,
+      durationTs: s.duration_ts === undefined ? undefined : Number(s.duration_ts),
+      timeBase: s.time_base,
       channels: s.channels,
     })),
     bytes: Number(data.format?.size) || 0,
   };
 }
 export interface AssetImportMetadata {
+  importReceipt?: { key: string; digest: string };
+  timeBase?: {
+    version: number;
+    source: { id: string; revision: number };
+    mapping: string;
+    sourceTimestamps: number[];
+    workingFramesPerSecond: number;
+    playbackRate: number;
+    converted: boolean;
+  };
   name?: string;
   category?: string;
   entityId?: string;
@@ -120,6 +138,15 @@ export interface AssetImportMetadata {
     spec: unknown;
     sampled: unknown;
   };
+  deliveryId?: string;
+  processingSource?: {
+    version: 1;
+    jobId: string;
+    action: string;
+    sources: { id: string; revision: number }[];
+    parameters: Record<string, unknown>;
+    previewOnly?: boolean;
+  };
   production?: { taskId: string; taskRevision: number; viewId: string; deliveryId: string };
 }
 export async function hashFile(file: string) {
@@ -136,6 +163,8 @@ export async function ingestAsset(
   policy?: { exportJobId: string },
 ) {
   const allowed = new Set([
+    'importReceipt',
+    'timeBase',
     'name',
     'category',
     'entityId',
@@ -148,6 +177,8 @@ export async function ingestAsset(
     'derivedSource',
     'previsualSource',
     'production',
+    'deliveryId',
+    'processingSource',
   ]);
   for (const key of Object.keys(info))
     if (!allowed.has(key)) throw new HttpError(400, `素材元数据字段不支持：${key}`);
@@ -275,6 +306,14 @@ export async function ingestAsset(
     });
   }
   return store.transaction(() => {
+    if (info.importReceipt) {
+      const receipt = store.setting<any>(info.importReceipt.key, null);
+      if (receipt) {
+        if (receipt.digest !== info.importReceipt.digest)
+          throw new HttpError(409, '导入回执已用于不同文件或目标');
+        return store.get(receipt.object.id, receipt.object.revision);
+      }
+    }
     if (policy) {
       const existing = store
         .list('asset', projectId)
@@ -324,6 +363,8 @@ export async function ingestAsset(
         variant: info.variant || '默认',
         path: relative,
         sha256,
+        ...(info.timeBase ? { timeBase: info.timeBase } : {}),
+        ...(info.processingSource ? { processingSource: info.processingSource } : {}),
         adopted: false,
         sourceAssetIds: info.sourceAssetIds || [],
         prompt: info.prompt || '',
@@ -341,6 +382,13 @@ export async function ingestAsset(
       store.db
         .prepare('INSERT INTO derivations VALUES(?,?,?,?)')
         .run(projectId, identity, asset.id, JSON.stringify(source || previs));
+    if (info.importReceipt)
+      store.setSetting(info.importReceipt.key, {
+        digest: info.importReceipt.digest,
+        status: 'archived',
+        object: { id: asset.id, revision: asset.revision },
+        kind: 'asset',
+      });
     return asset;
   });
 }
@@ -420,7 +468,7 @@ export async function exportMovie(
   signal?: AbortSignal,
   checkpoint?: import('./render.js').RenderCheckpointOptions,
 ) {
-  if (edl.schemaVersion === 2) {
+  if (edl.schemaVersion === 2 || edl.schemaVersion === 3) {
     const { renderTimeline } = await import('./render.js');
     return renderTimeline(edl, assets, root, output, signal, checkpoint);
   }

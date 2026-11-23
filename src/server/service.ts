@@ -1,4 +1,7 @@
 import { creationCapabilities } from './capabilities.js';
+import { updateVoiceDependents } from './voice-impact.js';
+import { ModelRegistry } from './model-registry.js';
+import { freezeModelPreparation } from './video-api-compile.js';
 import { productionHead } from './creation-heads.js';
 import {
   modularRefTemplate,
@@ -275,6 +278,7 @@ export class StudioService {
         }
       }
       this.invalidate(id, changedSegments);
+      updateVoiceDependents(this.store, id);
       return next;
     });
   }
@@ -348,9 +352,8 @@ export class StudioService {
   }
   confirmContinuity(episodeId: string, revision: number, data: any) {
     const ep = this.store.get(episodeId);
-    if (ep.data.seriesProduction) throw new HttpError(409, 'V7 剧情事实通过整集交付确认');
-    if (ep.kind !== 'episode' || ep.revision !== revision || !ep.data.approved)
-      throw new HttpError(409, '请先确认当前分集版本');
+    if (ep.kind !== 'episode' || ep.revision !== revision)
+      throw new HttpError(409, '分集版本已变化，请重新读取');
     const refs = [{ id: ep.id, revision: ep.revision }, ...(data.references || [])];
     for (const ref of refs) this.owned(ref.id, ep.projectId, undefined, ref.revision);
     return this.store.transaction(() => {
@@ -359,6 +362,8 @@ export class StudioService {
         facts: data.facts || {},
         openLoops: data.openLoops || [],
         references: refs,
+        schemaVersion: 4,
+        basis: 'authored_story',
         confirmed: true,
         stale: false,
       };
@@ -377,16 +382,47 @@ export class StudioService {
     profile: ComfyProfile,
     scopeReference?: { id: string; revision: number },
   ) {
-    const req = generationPreviewSchema.parse(raw);
-    const capabilities = creationCapabilities(this.store, profile);
+    let req = generationPreviewSchema.parse(raw);
+    const modelEpisode = this.store.get(req.episodeId);
+    const execution = new ModelRegistry(this.store).resolve(
+      modelEpisode.projectId,
+      modelEpisode.id,
+      'video',
+      req.segmentId,
+    );
+    const nativeApi = !!execution && execution.protocol !== 'comfy-h3';
+    const previousRow = execution
+      ? this.store.db
+          .prepare(
+            "SELECT id,input FROM jobs WHERE episode_id=? AND kind='generation' AND json_extract(input,'$.segment.id')=? ORDER BY rowid DESC LIMIT 1",
+          )
+          .get(modelEpisode.id, req.segmentId)
+      : null;
+    const previousExecution = previousRow
+      ? { jobId: String(previousRow.id), input: JSON.parse(String(previousRow.input)) }
+      : undefined;
+    if (execution) {
+      profile = {
+        baseUrl: execution.connection.data.baseUrl,
+        instanceId: execution.connection.data.instanceId || execution.connection.id,
+      };
+      if (!nativeApi) req = { ...req, ...execution.selection.parameters } as typeof req;
+    }
+    if (!nativeApi && (req.width > 1344 || req.height > 1344 || req.width % 32 || req.height % 32))
+      throw new HttpError(400, 'H3 ComfyUI 画布需要不超过 1344 且为 32 的倍数');
+    const capabilities = creationCapabilities(
+      this.store,
+      profile,
+      execution
+        ? this.store.setting<any>(
+            `model_probe:${execution.connection.id}:${execution.connection.revision}`,
+            null,
+          )?.discovery || null
+        : undefined,
+    );
     const ep = this.store.get(req.episodeId);
-    if (
-      ep.kind !== 'episode' ||
-      ep.revision !== req.episodeRevision ||
-      !ep.data.approved ||
-      ep.data.stale
-    )
-      throw new HttpError(409, '分集需先审核，或已发生版本变化');
+    if (ep.kind !== 'episode' || ep.revision !== req.episodeRevision)
+      throw new HttpError(409, '分集不存在或已发生版本变化');
     let segment = ep.data.segments.find((s: any) => s.id === req.segmentId);
     if (!segment) throw new HttpError(400, '片段不存在');
     const head = productionHead(this.store, ep.id);
@@ -434,6 +470,8 @@ export class StudioService {
         throw new HttpError(409, '执行片段包含范围外镜头');
       segment = projected;
     }
+    if (!nativeApi && (segment.duration < 5 || segment.duration > 15))
+      throw new HttpError(400, 'H3 ComfyUI 片段需要 5–15 秒；请调整分组或选择支持该时长的模型');
     if (
       ep.data.dramaturgy &&
       segment.generationMode === 'formal' &&
@@ -444,6 +482,7 @@ export class StudioService {
     )
       throw new HttpError(409, '长片正式生成需要发布本片段参考方案，固定主体、图片与关键帧版本');
     if (
+      !nativeApi &&
       capabilities.guidedImages.available === false &&
       (segment.guides?.length ||
         [modularRefTemplate, universalRefTemplate, seriesRefTemplate].includes(
@@ -454,7 +493,8 @@ export class StudioService {
         409,
         '已保存的节点探测不支持所需图片参考：' + capabilities.guidedImages.reason,
       );
-    if (req.width * req.height > 1344 * 768) throw new HttpError(400, '超过 H3 原生画布面积');
+    if (!nativeApi && req.width * req.height > 1344 * 768)
+      throw new HttpError(400, '超过 H3 原生画布面积');
     const seriesMode = [seriesRefTemplate, seriesBaseTemplate].includes(segment.executionVersion);
     if (ep.data.seriesProduction && !seriesMode)
       throw new HttpError(409, 'V7 系列需要明确升级的 H3 v4 模板');
@@ -475,6 +515,8 @@ export class StudioService {
       seriesRefTemplate,
       seriesBaseTemplate,
     ].includes(segment.executionVersion);
+    if (execution && !modular)
+      throw new HttpError(409, '模型选择需要当前已审核导演模板；旧冻结任务仍按原输入恢复');
     if ((segment.incoming || segment.repair) && !universal)
       throw new HttpError(400, '接续与修订契约需要新版 V3 模板');
     const continuation = universal ? prepareContinuation(this.store, ep, segment) : null;
@@ -541,8 +583,7 @@ export class StudioService {
       const records = domain.refs(shots).map((r) => domain.owned(ep.projectId, r));
       const assets = segment.references.map((r: any) => {
         const asset = this.owned(r.assetId, ep.projectId, 'asset', r.revision);
-        if (!asset.data.adopted || asset.data.mediaType !== 'image')
-          throw new HttpError(400, 'Base 首尾帧必须是已采用图片');
+        if (asset.data.mediaType !== 'image') throw new HttpError(400, 'Base 首尾帧必须是图片');
         return { reference: r, asset };
       });
       const input: any = {
@@ -587,8 +628,9 @@ export class StudioService {
           };
         input.dependencies = generationDependencies(input);
       }
-      input.prepared = prepareModularH3(input);
-      return { input, digest: generationDigest(input), projectId: ep.projectId };
+      if (!nativeApi) input.prepared = prepareModularH3(input);
+      const frozen = freezeModelPreparation(input, execution, previousExecution);
+      return { input: frozen, digest: generationDigest(frozen), projectId: ep.projectId };
     }
     if (segment.referencePlan) {
       const planning = resolveReferencePlan(this.store, ep, segment, req.width / req.height);
@@ -656,8 +698,9 @@ export class StudioService {
             };
           input.dependencies = generationDependencies(input);
         }
-        input.prepared = prepareModularH3(input);
-        return { input, digest: generationDigest(input), projectId: ep.projectId };
+        if (!nativeApi) input.prepared = prepareModularH3(input);
+        const frozen = freezeModelPreparation(input, execution, previousExecution);
+        return { input: frozen, digest: generationDigest(frozen), projectId: ep.projectId };
       }
       input.prepared = segment.executionVersion
         ? prepareDirectedH3(input)
@@ -679,7 +722,6 @@ export class StudioService {
       })
       .map((r: any) => {
         const a = this.owned(r.assetId, ep.projectId, 'asset', r.revision);
-        if (!a.data.adopted) throw new HttpError(400, '请先采用参考素材');
         return { reference: r, asset: a };
       });
     const input: any = {
@@ -725,14 +767,14 @@ export class StudioService {
     },
   ) {
     const edl = edlSchema.parse(raw);
-    this.owned(edl.episodeId, projectId, 'episode');
+    if (edl.episodeId) this.owned(edl.episodeId, projectId, 'episode');
     this.validateEdl(projectId, edl);
     if (revision !== undefined && !identity?.id)
       throw new HttpError(400, '更新时间线必须指定 ID 和版本');
     const old = identity?.id ? this.owned(identity.id, projectId, 'edl') : undefined;
     if (
       old &&
-      (old.parentId !== edl.episodeId ||
+      (old.parentId !== (edl.episodeId || null) ||
         JSON.stringify(old.data.owner) !== JSON.stringify(identity?.owner))
     )
       throw new HttpError(409, '时间线归属不可改变，请通过所属交付计划保存');
@@ -755,7 +797,7 @@ export class StudioService {
             'edl',
             projectId,
             { ...edl, ...(identity?.owner ? { owner: identity.owner } : {}), dependencies },
-            edl.episodeId,
+            edl.episodeId || null,
             identity?.createId,
           );
       new DomainService(this.store).dependencies(doc, dependencies);
@@ -763,66 +805,32 @@ export class StudioService {
     });
   }
   validateEdl(projectId: string, edl: any) {
-    for (const id of new Set<string>(
-      edl.clips.flatMap((c: any) => (c.selection ? [c.selection.id] : [])),
-    )) {
-      const entries = edl.clips
-        .map((c: any, index: number) => ({ ...c, index }))
-        .filter((c: any) => c.selection?.id === id);
-      const selection = this.owned(
-        id,
-        projectId,
-        'segment_selection',
-        entries[0].selection.revision,
-      );
-      if (!selection.data.composition) continue;
-      const parts = selectionMedia(selection.data);
-      if (
-        entries.length !== parts.length ||
-        entries.some(
-          (e: any, n: number) =>
-            e.selection.revision !== selection.revision ||
-            e.index !== entries[0].index + n ||
-            e.assetId !== parts[n].video.id ||
-            e.revision !== parts[n].video.revision ||
-            e.in !== parts[n].in ||
-            e.out !== parts[n].out,
-        )
-      )
-        throw new HttpError(409, '局部修订装配必须完整保留已审核的片段顺序；调整裁剪需要重新采用');
-    }
     for (const [audioOnly, clips] of [
       [false, edl.clips],
       [true, edl.audio],
     ] as const) {
       for (const clip of clips) {
         if (clip.selection) {
-          const selection = this.owned(
+          const selected = this.owned(
             clip.selection.id,
             projectId,
             'segment_selection',
             clip.selection.revision,
           );
           if (
-            selection.data.composition
-              ? !selectionMedia(selection.data).some(
-                  (part) =>
-                    part.video.id === clip.assetId &&
-                    part.video.revision === clip.revision &&
-                    part.in === clip.in &&
-                    part.out === clip.out,
-                )
-              : selection.data.video.id !== clip.assetId ||
-                selection.data.video.revision !== clip.revision ||
-                clip.in < selection.data.in ||
-                clip.out > selection.data.out ||
-                (selection.data.schemaVersion === 3 &&
-                  (clip.in !== selection.data.in || clip.out !== selection.data.out))
+            !selectionMedia(selected.data).some(
+              (part) => part.video.id === clip.assetId && part.video.revision === clip.revision,
+            )
           )
-            throw new HttpError(409, '候选或区间变化需要重新审核片段选择');
+            throw new HttpError(400, '片段来源与时间线素材不匹配');
         }
         const a = this.owned(clip.assetId, projectId, 'asset', clip.revision);
-        if (!a.data.adopted) throw new HttpError(400, '时间线只可使用已采用素材');
+        if (audioOnly && 'sampleRange' in clip && clip.sampleRange) {
+          const samples = clip.sampleRange,
+            rate = Number(a.data.streams?.find((s: any) => s.type === 'audio')?.sampleRate);
+          if (samples.sampleRate !== rate || samples.outSample > Math.round(a.data.duration * rate))
+            throw new HttpError(400, '音轨采样区间必须来自实际归档音频');
+        }
         if (audioOnly && a.data.mediaType !== 'audio' && !a.data.hasAudio)
           throw new HttpError(400, '此素材没有音轨');
         if (!audioOnly && a.data.mediaType === 'audio')

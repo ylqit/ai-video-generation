@@ -1,5 +1,4 @@
 import { directingSchema } from './directing.js';
-import { mouthObservationFields } from './mouth-review.js';
 import { z } from 'zod';
 import {
   shotStateSchema,
@@ -11,7 +10,10 @@ import {
 import { dramaturgySchema, shotProductionSchema } from './longform.js';
 import { incomingSchema, repairSchema } from './shot-semantics.js';
 import { episodeProductionSchema } from './series.js';
-import { creationOverlaySchema } from './creation.js';
+import { timelineMap } from './edit-timeline.js';
+import type { EditDecisionList } from './edit-timeline.js';
+export { edlSchema } from './edit-timeline.js';
+export type { EditDecisionList } from './edit-timeline.js';
 
 export const kinds = [
   'project',
@@ -38,12 +40,21 @@ export const kinds = [
   'assembly_review',
   'episode_release',
   'creation_settings',
+  'model_execution_config',
   'creation_run',
+  'assistant_run',
+  'assistant_session',
+  'node_analysis',
+  'director_scene',
+  'series_proposal',
+  'source_index',
+  'validation_experiment',
   'authoring_result',
   'creation_delivery',
   'creation_delivery_plan',
   'creation_scope',
   'workspace_layout',
+  'canvas',
   'creation_message',
   'creation_review_edit',
   'creation_media_issue',
@@ -104,7 +115,7 @@ export const segmentSchema = z.object({
   shotIds: z.array(z.string()).min(1),
   prompt: z.string().min(1),
   mode: z.enum(['t2v', 'i2v', 'ref2va']),
-  duration: z.number().min(5).max(15),
+  duration: z.number().positive().max(900),
   references: z.array(referenceSchema).default([]),
   guides: z.array(guideSchema).default([]),
   guidedPrompt: guidedPromptSchema.nullable().default(null),
@@ -145,100 +156,6 @@ export const episodePlanSchema = z.object({
 export type EpisodePlan = z.infer<typeof episodePlanSchema>;
 export type GenerationSegment = z.infer<typeof segmentSchema>;
 
-export const edlSchema = z
-  .object({
-    overlays: z.array(creationOverlaySchema).max(2000).optional(),
-    schemaVersion: z.literal(2).optional(),
-    episodeId: z.string(),
-    width: z
-      .number()
-      .int()
-      .min(128)
-      .max(3840)
-      .refine((v) => v % 2 === 0),
-    height: z
-      .number()
-      .int()
-      .min(128)
-      .max(3840)
-      .refine((v) => v % 2 === 0),
-    fps: z.literal(24),
-    clips: z
-      .array(
-        z.object({
-          assetId: z.string(),
-          revision: z.number().int().positive(),
-          in: z.number().nonnegative(),
-          out: z.number().positive(),
-          volume: z.number().min(0).max(1),
-          fadeInFrames: z.number().int().nonnegative().optional(),
-          fadeOutFrames: z.number().int().nonnegative().optional(),
-          selection: versionRef.optional(),
-          role: z.enum(['story', 'intro', 'outro', 'recap']).optional(),
-        }),
-      )
-      .min(1),
-    audio: z.array(
-      z.object({
-        assetId: z.string(),
-        revision: z.number().int().positive(),
-        in: z.number().nonnegative(),
-        out: z.number().positive(),
-        start: z.number().nonnegative(),
-        dialogueTake: versionRef.optional(),
-        originalAudio: z.literal('muted').optional(),
-        lipSyncReviewed: z.boolean().optional(),
-        ...mouthObservationFields,
-        volume: z.number().min(0).max(1),
-        fadeInFrames: z.number().int().nonnegative().optional(),
-        fadeOutFrames: z.number().int().nonnegative().optional(),
-      }),
-    ),
-  })
-  .superRefine((edl, ctx) => {
-    const frames = Math.round(edl.clips.reduce((n, c) => n + c.out - c.in, 0) * 24);
-    if (edl.overlays?.length && edl.schemaVersion !== 2)
-      ctx.addIssue({ code: 'custom', path: ['overlays'], message: '精确图文需要新版时间线' });
-    if (new Set(edl.overlays?.map((o) => o.id)).size !== (edl.overlays?.length || 0))
-      ctx.addIssue({ code: 'custom', path: ['overlays'], message: '图文标识重复' });
-    edl.overlays?.forEach((o, i) => {
-      if (o.endFrame <= o.startFrame || o.endFrame > frames)
-        ctx.addIssue({
-          code: 'custom',
-          path: ['overlays', i],
-          message: '图文区间必须位于实际成片内',
-        });
-    });
-    for (const [track, clips] of [
-      ['clips', edl.clips],
-      ['audio', edl.audio],
-    ] as const) {
-      clips.forEach((clip, i) => {
-        if (clip.out <= clip.in)
-          ctx.addIssue({ code: 'custom', path: [track, i, 'out'], message: '出点必须大于入点' });
-        if (edl.schemaVersion === 2) {
-          for (const [key, v] of Object.entries(clip))
-            if (
-              ['in', 'out', 'start'].includes(key) &&
-              typeof v === 'number' &&
-              Math.abs(v * 24 - Math.round(v * 24)) > 1e-6
-            )
-              ctx.addIssue({
-                code: 'custom',
-                path: [track, i, key],
-                message: '新版时间线必须使用 24 fps 整帧边界',
-              });
-          if (
-            (clip.fadeInFrames || 0) + (clip.fadeOutFrames || 0) >
-            Math.round((clip.out - clip.in) * 24)
-          )
-            ctx.addIssue({ code: 'custom', path: [track, i], message: '淡入淡出不能超过片段时长' });
-        } else if (clip.fadeInFrames || clip.fadeOutFrames)
-          ctx.addIssue({ code: 'custom', path: [track, i], message: '声音包络需要新版时间线' });
-      });
-    }
-  });
-export type EditDecisionList = z.infer<typeof edlSchema>;
 export interface ContinuitySnapshot {
   facts: Record<string, unknown>;
   openLoops: string[];
@@ -278,9 +195,20 @@ export const jobStates = [
 export type JobState = (typeof jobStates)[number];
 export interface Job {
   id: string;
-  projectId: string;
+  projectId: string | null;
   episodeId: string | null;
-  kind: 'generation' | 'creative' | 'export';
+  kind:
+    | 'generation'
+    | 'creative'
+    | 'image'
+    | 'export'
+    | 'voice_clone'
+    | 'speech'
+    | 'lipsync'
+    | 'media_process'
+    | 'media_analysis'
+    | 'transcription'
+    | 'previs';
   state: JobState;
   input: any;
   output: any;
@@ -305,14 +233,14 @@ export const generationRequestSchema = z.object({
     .number()
     .int()
     .min(128)
-    .max(1344)
-    .refine((v) => v % 32 === 0),
+    .max(3840)
+    .refine((v) => v % 2 === 0),
   height: z
     .number()
     .int()
     .min(128)
-    .max(1344)
-    .refine((v) => v % 32 === 0),
+    .max(3840)
+    .refine((v) => v % 2 === 0),
   steps: z.number().int().min(1).max(50).default(20),
   seed: z.number().int().min(0).max(2147483647),
   approved: z.literal(true),
@@ -331,7 +259,9 @@ export function clipDuration(clip: { in: number; out: number }) {
   return clip.out - clip.in;
 }
 export function timelineDuration(edl: EditDecisionList) {
-  return edl.clips.reduce((n, c) => n + clipDuration(c), 0);
+  return edl.schemaVersion === 3
+    ? timelineMap(edl).frames / 24
+    : edl.clips.reduce((n, c) => n + clipDuration(c), 0);
 }
 export function frameCount(seconds: number) {
   const f = Math.max(5, Math.round(seconds * 24));

@@ -70,7 +70,6 @@ export function prepareGuidedH3(
     const asset = assets.get(key);
     if (!asset || asset.data.mediaType !== 'image')
       throw new HttpError(400, '本版关键帧增强需要图片参考；视频和音频参考请使用普通 Ref2VA');
-    if (!asset.data.adopted) throw new HttpError(400, '请先采用参考素材与关键帧');
     if (!(asset.data.width > 0 && asset.data.height > 0))
       throw new HttpError(400, '图片缺少有效尺寸');
     images.push({

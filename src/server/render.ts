@@ -1,3 +1,5 @@
+import { timelineMap } from '../shared/edit-timeline.js';
+import { visualBlockInput } from './render-visual.js';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
@@ -28,7 +30,22 @@ export interface RenderCheckpointOptions {
 }
 export function renderPlan(edl: EditDecisionList) {
   edlSchema.parse(edl);
-  if (edl.schemaVersion !== 2) throw new Error('分块渲染需要 v2 时间线');
+  if (!edl.schemaVersion) throw new Error('分块渲染需要整帧时间线');
+  if (edl.schemaVersion === 3) {
+    const map = timelineMap(edl);
+    const blocks = [];
+    for (let startFrame = 0; startFrame < map.frames; startFrame += 288) {
+      const endFrame = Math.min(map.frames, startFrame + 288);
+      blocks.push({
+        startFrame,
+        endFrame,
+        clips: map.clips
+          .filter((c) => c.startFrame < endFrame && c.endFrame > startFrame)
+          .map((c) => c.clip),
+      });
+    }
+    return { blocks, frames: map.frames };
+  }
   const blocks: { startFrame: number; endFrame: number; clips: EditDecisionList['clips'] }[] = [];
   let frame = 0;
   for (let i = 0; i < edl.clips.length; i += 12) {
@@ -59,7 +76,11 @@ export async function renderTimeline(
   const digest = createHash('sha256')
     .update(
       JSON.stringify({
-        renderer: 'frame-render-v1',
+        renderer: edl.audio.some((a) => a.sampleRange)
+          ? 'frame-render-v3.3-sample-audio'
+          : edl.schemaVersion === 3
+            ? 'frame-render-v3.2'
+            : 'frame-render-v1',
         edl,
         assets: assets.map((a) => [a.id, a.revision, a.data.sha256]),
       }),
@@ -113,25 +134,31 @@ export async function renderTimeline(
       video = path.join(dir, `${key}.mp4`);
       const args: string[] = [],
         filters: string[] = [];
-      for (const [i, c] of block.clips.entries()) {
-        const a = asset(c.assetId, c.revision),
-          count = Math.round(clipDuration(c) * 24);
-        if (a.data.mediaType === 'image') args.push('-loop', '1', '-framerate', '24');
-        args.push(
-          '-ss',
-          String(c.in),
-          '-t',
-          String(clipDuration(c)),
-          '-i',
-          inside(root, a.data.path),
-        );
+      if (edl.schemaVersion === 3) {
+        const input = visualBlockInput(edl, assets, root, block.startFrame, block.endFrame);
+        args.push(...input.args);
+        filters.push(...input.filters);
+      } else {
+        for (const [i, c] of block.clips.entries()) {
+          const a = asset(c.assetId, c.revision),
+            count = Math.round(clipDuration(c) * 24);
+          if (a.data.mediaType === 'image') args.push('-loop', '1', '-framerate', '24');
+          args.push(
+            '-ss',
+            String(c.in),
+            '-t',
+            String(clipDuration(c)),
+            '-i',
+            inside(root, a.data.path),
+          );
+          filters.push(
+            `[${i}:v]scale=${edl.width}:${edl.height}:force_original_aspect_ratio=decrease,pad=${edl.width}:${edl.height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=24,trim=end_frame=${count},setpts=N/(24*TB),format=yuv420p[v${i}]`,
+          );
+        }
         filters.push(
-          `[${i}:v]scale=${edl.width}:${edl.height}:force_original_aspect_ratio=decrease,pad=${edl.width}:${edl.height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=24,trim=end_frame=${count},setpts=N/(24*TB),format=yuv420p[v${i}]`,
+          `${block.clips.map((_, i) => `[v${i}]`).join('')}concat=n=${block.clips.length}:v=1:a=0[v]`,
         );
       }
-      filters.push(
-        `${block.clips.map((_, i) => `[v${i}]`).join('')}concat=n=${block.clips.length}:v=1:a=0[v]`,
-      );
       await execute([
         ...args,
         '-filter_complex_threads',
@@ -169,11 +196,13 @@ export async function renderTimeline(
     if (!audio) {
       // Every stem has block length. Absolute offsets keep envelopes unchanged at block boundaries.
       const clips: { c: EditDecisionList['audio'][number]; offset: number }[] = [];
-      let cursor = block.startFrame / 24;
-      for (const c of block.clips) {
+      for (const entry of timelineMap(edl).clips.filter(
+        (e) => e.startFrame < block.endFrame && e.endFrame > block.startFrame,
+      )) {
+        const c = entry.clip,
+          offset = entry.startFrame / 24;
         if (asset(c.assetId, c.revision).data.hasAudio)
-          clips.push({ c: { ...c, start: cursor }, offset: cursor });
-        cursor += clipDuration(c);
+          clips.push({ c: { ...c, start: offset }, offset });
       }
       for (const c of edl.audio)
         if (c.start < block.endFrame / 24 && c.start + clipDuration(c) > block.startFrame / 24)
@@ -190,19 +219,25 @@ export async function renderTimeline(
           const start = Math.max(offset, block.startFrame / 24),
             end = Math.min(offset + clipDuration(c), block.endFrame / 24),
             sourceOffset = start - offset;
-          args.push(
-            '-ss',
-            String(c.in + sourceOffset),
-            '-t',
-            String(end - start),
-            '-i',
-            inside(root, asset(c.assetId, c.revision).data.path),
-          );
+          const samples = c.sampleRange;
+          if (samples) args.push('-i', inside(root, asset(c.assetId, c.revision).data.path));
+          else
+            args.push(
+              '-ss',
+              String(c.in + sourceOffset),
+              '-t',
+              String(end - start),
+              '-i',
+              inside(root, asset(c.assetId, c.revision).data.path),
+            );
           const fi = (c.fadeInFrames || 0) / 24,
             fo = (c.fadeOutFrames || 0) / 24;
           const expression = `${c.volume}*max(0,min(1,min(${fi ? `(t+${sourceOffset})/${fi}` : '1'},${fo ? `(${clipDuration(c)}-t-${sourceOffset})/${fo}` : '1'})))`;
+          const trim = samples
+            ? `atrim=start_sample=${samples.inSample + Math.round(sourceOffset * samples.sampleRate)}:end_sample=${Math.min(samples.outSample, samples.inSample + Math.round((end - offset) * samples.sampleRate))},`
+            : '';
           filters.push(
-            `[${i}:a]asetpts=PTS-STARTPTS,aresample=48000,aformat=channel_layouts=stereo,aeval='val(0)*${expression}|val(1)*${expression}',adelay=${Math.round((start - block.startFrame / 24) * 48000)}S:all=1,apad,atrim=end_sample=${frames * 2000}[a${i}]`,
+            `[${i}:a]${trim}asetpts=PTS-STARTPTS,aresample=48000,aformat=channel_layouts=stereo,aeval='val(0)*${expression}|val(1)*${expression}',adelay=${Math.round((start - block.startFrame / 24) * 48000)}S:all=1,apad,atrim=end_sample=${frames * 2000}[a${i}]`,
           );
           labels.push(`[a${i}]`);
         }

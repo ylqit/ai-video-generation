@@ -1,0 +1,25 @@
+export const taskKindLabels: Record<string, string> = {
+  creative: '文字创作',
+  image: '图片生成',
+  generation: '视频生成',
+  export: '剪辑导出',
+  voice_clone: '音色复刻',
+  speech: '语音合成',
+  lipsync: '口型处理',
+  media_process: '媒体加工',
+  media_analysis: '文字与视觉分析',
+  transcription: '语音转写',
+  previs: '导演预演渲染',
+};
+export const taskStateLabels: Record<string, string> = {
+  queued: '排队',
+  preparing: '准备输入',
+  submitting: '提交中',
+  unknown: '受理待核对',
+  submitted: '已受理',
+  running: '执行中',
+  archiving: '归档中',
+  succeeded: '执行已完成',
+  failed: '执行失败',
+  cancelled: '已停止',
+};

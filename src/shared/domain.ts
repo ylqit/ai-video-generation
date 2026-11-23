@@ -340,7 +340,7 @@ export const selectionSchema = z.object({
   segmentId: z.string(),
   jobId: z.string(),
   video: versionRef,
-  review: versionRef,
+  review: versionRef.nullable().optional(),
   in: z.number().nonnegative(),
   out: z.number().positive(),
   volume: z.number().min(0).max(1).default(1),
@@ -348,7 +348,7 @@ export const selectionSchema = z.object({
     .array(
       z.object({ shotId: z.string(), in: z.number().nonnegative(), out: z.number().positive() }),
     )
-    .min(1),
+    .default([]),
 });
 export const canonSchema = z.object({
   episode: versionRef,

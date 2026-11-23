@@ -38,6 +38,7 @@ onBeforeUnmount(() => data.dispose());
     <label>{{ label || '搜索引用' }}<input v-model="q" placeholder="按名称搜索整个项目" /></label>
     <p class="error" v-if="error">{{ error }}</p>
     <select
+      :aria-label="label || '选择固定引用'"
       @change="
         emit(
           'select',

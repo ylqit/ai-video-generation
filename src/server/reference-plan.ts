@@ -10,13 +10,11 @@ export function resolveReferencePlan(store: Store, episode: any, segment: any, a
   const domain = new DomainService(store);
   const plan = domain.owned(episode.projectId, segment.referencePlan, 'reference_plan');
   if (
-    !plan.data.published ||
-    plan.data.stale ||
     store.get(plan.id).revision !== plan.revision ||
     plan.data.episodeId !== episode.id ||
     plan.data.segmentId !== segment.id
   )
-    throw new HttpError(409, '本次参考方案需要重新审核发布');
+    throw new HttpError(409, '参考方案版本或片段归属已变化，请重新准备');
   if (segment.mode !== 'ref2va')
     throw new HttpError(400, '参考方案 v2 当前用于 Ref2VA；首尾帧 I2V 使用原入口');
   const universal = ['native-h3-directed-v3', 'native-h3-directed-v4'].includes(
@@ -29,14 +27,6 @@ export function resolveReferencePlan(store: Store, episode: any, segment: any, a
   const checks = domain
     .shotChecks(episode.projectId, episode.data.shots)
     .filter((c: any) => segment.shotIds.includes(c.shotId));
-  if (checks.some((c: any) => c.severity === 'blocking'))
-    throw new HttpError(
-      400,
-      checks
-        .filter((c: any) => c.severity === 'blocking')
-        .map((c) => c.message)
-        .join('；'),
-    );
   const instances = new Map<string, any>();
   for (const shot of shots)
     for (const entry of shot.state?.instances || []) {
@@ -48,7 +38,7 @@ export function resolveReferencePlan(store: Store, episode: any, segment: any, a
   const omittedByScope: any[] = [];
   const bindings = plan.data.bindings.filter((b: any) => {
     if (!universal) return true;
-    if (!b.usage?.reviewed) throw new HttpError(409, `参考 ${b.id} 尚未确认图片内容和用途`);
+    if (!b.usage) throw new HttpError(400, `参考 ${b.id} 缺少明确用途`);
     if (b.usage.purpose === 'sound' || b.usage.purpose === 'motion')
       throw new HttpError(
         400,
@@ -77,7 +67,6 @@ export function resolveReferencePlan(store: Store, episode: any, segment: any, a
       if (!instances.has(id)) throw new HttpError(400, `图片绑定到未出场实例 ${id}`);
     if (b.pack) {
       const pack = domain.owned(episode.projectId, b.pack, 'reference_pack');
-      if (pack.data.stale || !pack.data.published) throw new HttpError(409, '参考包需复核');
       for (const id of b.instanceIds) {
         const entry = instances.get(id);
         if (
@@ -157,11 +146,10 @@ export function resolveReferencePlan(store: Store, episode: any, segment: any, a
     else omitted.push({ bindingId: b.id, reason: '九图预算已满；辅助图片未纳入', asset: b.asset });
   }
   const selected = ordered.filter((b: any) => chosen.has(key(b)));
-  if (!selected.length) throw new HttpError(400, '参考方案至少需要一张已审核图片');
+  if (!selected.length) throw new HttpError(400, '参考方案至少需要一张图片');
   for (const b of selected) {
     const asset = domain.owned(episode.projectId, b.asset, 'asset');
-    if (!asset.data.adopted || asset.data.mediaType !== 'image')
-      throw new HttpError(400, '生成参考必须为已采用的图片版本');
+    if (asset.data.mediaType !== 'image') throw new HttpError(400, '生成参考必须为图片版本');
   }
   if (segment.executionVersion === 'native-h3-directed-v1') {
     const layouts = shots.flatMap((s: any) =>
@@ -180,17 +168,6 @@ export function resolveReferencePlan(store: Store, episode: any, segment: any, a
       ),
   );
   const mode = segment.generationMode || 'formal';
-  if (gateRisks.length && mode === 'formal')
-    throw new HttpError(
-      409,
-      `正式生成检查未通过：${gateRisks.map((r) => `${r.code} ${r.message}`).join('；')}`,
-    );
-  const unacknowledged = gateRisks.filter((r) => !plan.data.acknowledgedRisks.includes(r.code));
-  if (unacknowledged.length)
-    throw new HttpError(
-      409,
-      `探索生成需在参考方案中确认风险：${unacknowledged.map((r) => r.code).join(', ')}`,
-    );
   const records = [...instances.values()]
     .flatMap((i) => [i.entity, i.appearance, i.pack].filter(Boolean))
     .concat(shots.flatMap((s: any) => (s.state?.layout ? [s.state.layout] : [])))

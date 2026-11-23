@@ -49,6 +49,30 @@ if (args[0] === 'restore') {
     .prepare("SELECT document FROM revisions WHERE json_extract(document,'$.kind')='asset'")
     .all();
   const paths = new Set(rows.map((r) => JSON.parse(String(r.document)).data.path as string));
+  for (const r of snapshot.prepare('SELECT bundle FROM library_versions').all()) {
+    const bundle = JSON.parse(String(r.bundle));
+    if (bundle.kind === 'voice_media') paths.add(bundle.data.path);
+  }
+  // Submission receipts are recovery evidence; without them a restored unknown job cannot reconcile.
+  for (const job of snapshot.prepare('SELECT id FROM jobs').all()) {
+    const relative = `jobs/${job.id}`,
+      directory = inside(config.dataDir, relative);
+    if (
+      !(await fs.stat(directory).then(
+        (s) => s.isDirectory(),
+        () => false,
+      ))
+    )
+      continue;
+    for (const entry of await fs.readdir(directory, { recursive: true, withFileTypes: true })) {
+      if (entry.isFile())
+        paths.add(
+          path
+            .relative(config.dataDir, path.join(entry.parentPath, entry.name))
+            .replaceAll('\\', '/'),
+        );
+    }
+  }
   const stored = snapshot
     .prepare("SELECT name FROM sqlite_master WHERE name='media_file_state'")
     .get()

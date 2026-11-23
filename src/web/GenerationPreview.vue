@@ -12,6 +12,68 @@ const anchors = computed(() =>
 <template>
   <div class="generation-preview" v-if="input.prepared">
     <h4>执行预览 · {{ input.templateVersion }}</h4>
+    <p v-if="input.formatComparison" :class="input.formatComparison.matches ? '' : 'warning'">
+      {{ input.formatComparison.message }} · 生成 {{ input.formatComparison.generation.width }}:{{
+        input.formatComparison.generation.height
+      }}
+      → 交付 {{ input.formatComparison.delivery.width }}×{{
+        input.formatComparison.delivery.height
+      }}
+    </p>
+    <p v-if="input.effectivePlan">
+      本集依据：{{ input.effectivePlan.series?.id || '项目' }}；{{
+        input.effectivePlan.runtime
+          ? `${input.effectivePlan.runtime.targetFrames / 24} 秒`
+          : input.effectivePlan.duration.mode
+      }}。本次片段不代表已完成整集。
+    </p>
+    <section v-if="input.modelExecution">
+      <p>
+        {{ input.modelExecution.connection.data.name }} v{{
+          input.modelExecution.connection.revision
+        }}
+        · {{ input.modelExecution.modelId }} · {{ input.modelExecution.protocol }}
+      </p>
+      <p>
+        Prompt 方案：{{
+          input.modelExecution.promptProfile
+        }}。能力登记与离线编译不代表真实调用已验证。
+      </p>
+      <details v-if="input.executionDifference?.comparedJobId" open>
+        <summary>与本组上次固定任务的执行差异</summary>
+        <p v-for="c in input.executionDifference.changes">
+          {{ c.field }}：{{ c.from }} → {{ c.to }}
+        </p>
+        <p v-if="!input.executionDifference.changes.length">执行选择和媒体职责未改变。</p>
+      </details>
+      <table
+        v-if="input.referenceBindingPlan?.bindings?.length || input.prepared.inputBindings?.length"
+      >
+        <thead>
+          <tr>
+            <th>标签</th>
+            <th>素材版本</th>
+            <th>用途</th>
+            <th>请求角色</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr
+            v-for="b in input.referenceBindingPlan?.bindings || input.prepared.inputBindings"
+            :key="b.id"
+          >
+            <td>{{ b.label }}</td>
+            <td>{{ b.asset.id }} v{{ b.asset.revision }}</td>
+            <td>{{ b.purpose }}</td>
+            <td>{{ b.role }}</td>
+          </tr>
+        </tbody>
+      </table>
+      <details v-if="input.prepared.request">
+        <summary>固定逻辑请求（提交时才读取媒体）</summary>
+        <pre>{{ input.prepared.request }}</pre>
+      </details>
+    </section>
     <section v-if="input.prepared.contractRevision === 2">
       <h4>设计与软件检查</h4>
       <p v-for="s in input.prepared.spatialAssessments" :key="s.shotId">
@@ -91,11 +153,11 @@ const anchors = computed(() =>
         <p v-for="b in input.planning.selected">{{ b.id }} · {{ b.role }} · {{ b.reason }}</p>
       </details></template
     >
-    <p>
+    <p v-if="!input.modelExecution || input.modelExecution.protocol === 'comfy-h3'">
       {{ input.width }} × {{ input.height }} · {{ input.steps }} 步 · 24 fps · seed
       {{ input.seed }} · ref_image_size=match
     </p>
-    <p v-if="input.capabilities">
+    <p v-if="input.capabilities && !input.modelExecution">
       能力校验：{{
         input.capabilities.verification === 'saved_probe' ? '使用已保存探测结果' : '连接待探测'
       }}；音色样本用于听审，动作时序通过文字请求。
@@ -169,7 +231,7 @@ const anchors = computed(() =>
       空间检查 {{ c.code }}：{{ c.message }}
     </p>
     <details>
-      <summary>完整 H3 提示词（本次执行冻结）</summary>
+      <summary>完整模型提示词（本次执行冻结）</summary>
       <pre>{{ input.prepared.finalPrompt }}</pre>
     </details>
     <p class="muted">保留要求是生成目标，结果需另行审核。</p>

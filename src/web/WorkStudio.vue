@@ -6,6 +6,7 @@ import { executionTextFields } from '../shared/execution-text';
 import { api, assetUrl } from './api';
 import ResourceCanvas from './ResourceCanvas.vue';
 import StoryboardView from './StoryboardView.vue';
+import StoryDevelopment from './StoryDevelopment.vue';
 import ContentPreview from './ContentPreview.vue';
 import AuthoringEditor from './AuthoringEditor.vue';
 import MediaLibrary from './MediaLibrary.vue';
@@ -17,6 +18,14 @@ import CreationVersions from './CreationVersions.vue';
 import ReferenceConfirmation from './ReferenceConfirmation.vue';
 import JobInspection from './JobInspection.vue';
 import ProjectTools from './ProjectTools.vue';
+import ProductionGuide from './ProductionGuide.vue';
+import ModelExecutionSettings from './ModelExecutionSettings.vue';
+import VisualPreparation from './VisualPreparation.vue';
+import ExecutionInspection from './ExecutionInspection.vue';
+import GenerationPreview from './GenerationPreview.vue';
+import ContinuationPreparation from './ContinuationPreparation.vue';
+import ProductionProgress from './ProductionProgress.vue';
+import type { WorkspaceIssue } from '../shared/workspace';
 const props = defineProps<{
   project: RecordDoc;
   version: number;
@@ -28,8 +37,9 @@ const snapshot = ref<WorkspaceSnapshot | null>(null),
   notice = ref(''),
   busy = ref(false),
   runId = ref(''),
-  episodeId = ref('');
-const view = ref<'canvas' | 'storyboard' | 'timeline'>('canvas'),
+  episodeId = ref(''),
+  seriesId = ref('');
+const view = ref<WorkspaceLayout['view']>('story'),
   layout = ref<WorkspaceLayout>({
     positions: {},
     view: 'canvas',
@@ -61,6 +71,16 @@ const run = computed(() => snapshot.value?.run),
   activeJobs = computed(
     () => snapshot.value?.jobs.filter((j) => !['succeeded', 'cancelled'].includes(j.state)) || [],
   );
+try {
+  const saved = JSON.parse(localStorage.getItem(`studio-position:${props.project.id}`) || 'null');
+  if (saved) {
+    seriesId.value = saved.seriesId || '';
+    episodeId.value = saved.episodeId || '';
+    runId.value = saved.runId || '';
+  }
+} catch {
+  /* A corrupt view preference must not prevent opening the work. */
+}
 const stateNames: Record<string, string> = {
   active: '准备继续',
   working: '创作中',
@@ -93,14 +113,30 @@ async function refresh() {
   try {
     const data = await api<WorkspaceSnapshot>(
       `/projects/${props.project.id}/workspace?` +
-        new URLSearchParams({ runId: runId.value, episodeId: episodeId.value }),
+        new URLSearchParams({
+          runId: runId.value,
+          episodeId: episodeId.value,
+          seriesId: seriesId.value,
+        }),
     );
     if (seq !== ticket || disposed) return;
     snapshot.value = data;
+    try {
+      localStorage.setItem(
+        `studio-position:${props.project.id}`,
+        JSON.stringify({
+          seriesId: data.context?.series?.id || '',
+          episodeId: data.context?.episode?.id || '',
+          runId: data.run?.id || '',
+        }),
+      );
+    } catch {
+      notice.value = '浏览器无法保存工作位置；作品数据不受影响。';
+    }
     if (!loadedLayout) {
       layout.value = structuredClone(data.layout.data);
       if (matchMedia('(max-width:1199px)').matches) layout.value.assistantCollapsed = true;
-      view.value = layout.value.view;
+      view.value = data.layout.id ? layout.value.view : 'story';
       loadedLayout = true;
     }
     if (!runId.value && data.run) runId.value = data.run.id;
@@ -121,6 +157,13 @@ watch(
   () => void refresh(),
 );
 watch(runId, () => void refresh());
+watch(seriesId, () => {
+  episodeId.value = '';
+  runId.value = '';
+  snapshot.value = null;
+  editing.value = preview.value = handoff.value = binding.value = null;
+  void refresh();
+});
 watch(episodeId, () => {
   runId.value = '';
   snapshot.value = null;
@@ -130,6 +173,49 @@ watch(episodeId, () => {
   void refresh();
 });
 void refresh();
+function clearPosition() {
+  try {
+    localStorage.removeItem(`studio-position:${props.project.id}`);
+  } catch {
+    /* Selection can still be cleared in memory. */
+  }
+  seriesId.value = '';
+  episodeId.value = '';
+  runId.value = '';
+  void refresh();
+}
+async function openIssue(issue: WorkspaceIssue) {
+  if (issue.destination === 'series') {
+    toolsTab.value = 'series';
+    showSeries.value = true;
+    return;
+  }
+  if (issue.jobId) {
+    jobDetail.value = issue.jobId;
+    return;
+  }
+  if (issue.destination === 'scope') {
+    switchView('storyboard');
+    return;
+  }
+  if (['references', 'candidate', 'delivery'].includes(issue.destination)) {
+    switchView('timeline');
+    return;
+  }
+  if (issue.target) {
+    try {
+      const record = await api(
+        `/projects/${props.project.id}/workspace-records/${issue.target.id}?revision=${issue.target.revision}`,
+      );
+      editing.value = { record, shotId: issue.shotId };
+    } catch (e: any) {
+      error.value = e.message;
+    }
+  } else {
+    layout.value.assistantCollapsed = false;
+    notice.value = issue.message;
+  }
+}
 async function act(fn: () => Promise<unknown>) {
   if (busy.value) return;
   busy.value = true;
@@ -166,7 +252,7 @@ async function saveLayout() {
     }
   }
 }
-function switchView(next: 'canvas' | 'storyboard' | 'timeline') {
+function switchView(next: WorkspaceLayout['view']) {
   view.value = next;
   layout.value.view = next;
   void saveLayout();
@@ -260,7 +346,22 @@ function openCandidate(id: string) {
   preview.value = snapshot.value?.candidates.find((c) => c.id === id)?.video || { data: {} };
 }
 function chooseScope(ids: string[]) {
-  scopeForm.value = { name: '本次制作范围', mode: 'selection', shotIds: [...ids], groupIds: [] };
+  const groups = new Set(
+    (snapshot.value?.results.director?.data.result.groups || [])
+      .filter((g: any) => g.shotIds.some((id: string) => ids.includes(id)))
+      .map((g: any) => g.id),
+  );
+  scopeForm.value = {
+    name: '本次制作范围',
+    mode: 'selection',
+    shotIds: [...ids],
+    groupIds: [],
+    continuations: Object.fromEntries(
+      Object.entries(snapshot.value?.scope?.data.continuations || {}).filter(([id]) =>
+        groups.has(id),
+      ),
+    ),
+  };
   scopeOutput.value = { ...(snapshot.value?.scope?.data.output || scopeOutput.value) };
   const existing = snapshot.value?.scope?.data.executionText?.entries || [];
   scopeWording.value = executionTextFields(
@@ -337,7 +438,7 @@ async function approve(result: any) {
 const bindingAttempts = new Map<string, string>();
 async function saveBinding() {
   await act(async () => {
-    if (!inspected.value || !['image', 'audio'].includes(boundAsset.value?.data.mediaType))
+    if (!['image', 'audio'].includes(boundAsset.value?.data.mediaType))
       throw new Error('请实际审看图片或听审音频后，再绑定参考用途');
     const body = {
       runRevision: run.value!.revision,
@@ -394,7 +495,7 @@ onBeforeUnmount(() => {
       <div class="work-status">
         <span class="status-tag review">{{ stateNames[run?.data.state] || '待开始创作' }}</span
         ><span class="allowance"
-          >剩余 {{ snapshot.allowance.remainingGenerations }} 次 /
+          >旧 ComfyUI 额度：{{ snapshot.allowance.remainingGenerations }} 次 /
           {{ snapshot.allowance.remainingSeconds }} 秒</span
         ><button
           @click="
@@ -423,9 +524,12 @@ onBeforeUnmount(() => {
       <div class="view-tabs">
         <button
           v-for="[id, label] in [
-            ['canvas', '资源画布'],
+            ['story', '剧本'],
+            ['visual', '视觉与素材'],
             ['storyboard', '分镜'],
-            ['timeline', '时间线'],
+            ['candidates', '候选'],
+            ['timeline', '剪辑交付'],
+            ['canvas', '资源画布'],
           ]"
           :key="id"
           :class="{ active: view === id }"
@@ -435,10 +539,47 @@ onBeforeUnmount(() => {
         </button>
       </div>
       <div class="toolbar">
-        <select v-if="project.data.mode === 'series'" v-model="episodeId" aria-label="选择分集">
+        <button
+          @click="
+            toolsTab = 'voices';
+            showSeries = true;
+          "
+        >
+          人物与声音
+        </button>
+        <select
+          v-if="snapshot.context?.seriesChoices.length"
+          :value="seriesId || snapshot.context.series?.id || ''"
+          @change="seriesId = ($event.target as HTMLSelectElement).value"
+          aria-label="选择系列"
+        >
+          <option value="">选择系列</option>
+          <option
+            v-for="series in snapshot.context.seriesChoices"
+            :key="series.id"
+            :value="series.id"
+          >
+            {{ series.title }}
+          </option>
+        </select>
+        <select
+          v-if="project.data.mode === 'series'"
+          :value="episodeId || snapshot.context?.episode?.id || ''"
+          @change="episodeId = ($event.target as HTMLSelectElement).value"
+          aria-label="选择分集"
+        >
           <option value="">选择分集</option>
           <option v-for="episode in snapshot.episodes" :key="episode.id" :value="episode.id">
             {{ episode.data.title }}
+          </option></select
+        ><select
+          v-if="snapshot.context?.selectionRequired === 'run'"
+          v-model="runId"
+          aria-label="选择创作版本"
+        >
+          <option value="">选择创作版本</option>
+          <option v-for="choice in snapshot.context.runChoices" :key="choice.id" :value="choice.id">
+            {{ choice.title }} · v{{ choice.revision }}
           </option></select
         ><button
           v-if="view === 'timeline' && run"
@@ -460,9 +601,22 @@ onBeforeUnmount(() => {
     <div v-if="notice" class="work-banner" role="status">
       {{ notice }}<button @click="notice = ''" aria-label="关闭提示">×</button>
     </div>
+    <ProductionGuide :snapshot="snapshot" @open="openIssue" />
+    <details>
+      <summary>当前制作范围的模型与 Prompt 选择</summary>
+      <ModelExecutionSettings
+        :project-id="project.id"
+        :initial-owner-id="
+          snapshot.context?.episode?.id || snapshot.context?.series?.id || project.id
+        "
+      />
+    </details>
     <div class="work-panels">
-      <section class="central-workspace">
-        <div v-if="view === 'canvas' && snapshot.candidates.length" class="review-arrival">
+      <section
+        class="central-workspace"
+        :class="{ 'creation-scroll': ['story', 'visual', 'candidates'].includes(view) }"
+      >
+        <div v-if="view === 'candidates' && snapshot.candidates.length" class="review-arrival">
           <div>
             <strong>{{ snapshot.candidates.length }} 个真实候选等待审看</strong
             ><span
@@ -471,16 +625,43 @@ onBeforeUnmount(() => {
             >
           </div>
           <div class="candidate-quick">
-            <button v-for="c in snapshot.candidates" :key="c.id" @click="openCandidate(c.id)">
+            <button
+              v-for="c in snapshot.candidates.slice(-12)"
+              :key="c.id"
+              @click="openCandidate(c.id)"
+            >
               <video
                 v-if="c.video"
                 :src="assetUrl(c.video.id, c.video.revision)"
                 muted
-                preload="metadata"
+                preload="none"
               /><span>{{ c.label }} ▷</span>
             </button>
           </div>
+          <p v-if="snapshot.candidates.length > 12">
+            这里只显示最近 12 个候选；其余可在分镜与审看编辑中按需打开。
+          </p>
         </div>
+        <VisualPreparation
+          v-if="view === 'visual'"
+          :snapshot="snapshot"
+          @handoff="handoff = $event"
+          @bind="
+            binding = $event;
+            boundAsset = $event.candidateAsset || null;
+            inspected = false;
+            bindingNote = '';
+          "
+          @shot="editing = { record: snapshot.results.director, shotId: $event }"
+        />
+        <StoryDevelopment
+          @refresh="refresh"
+          v-if="view === 'story'"
+          :snapshot="snapshot"
+          @edit="editing = $event"
+          @preview="openCard"
+          @discuss="discuss"
+        />
         <ResourceCanvas
           v-if="view === 'canvas'"
           :snapshot="snapshot"
@@ -499,11 +680,38 @@ onBeforeUnmount(() => {
           @discuss="discuss"
           @handoff="handoff = $event"
         />
-        <div v-else class="timeline-scroll" tabindex="0" aria-label="时间线与交付滚动区域">
-          <CreationVersions :snapshot="snapshot" @created="runId = $event" @refresh="refresh" />
-          <ReferenceConfirmation :snapshot="snapshot" @refresh="refresh" />
-          <DeliveryPlans :snapshot="snapshot" @refresh="refresh" />
+        <div
+          v-else-if="view === 'timeline' || view === 'candidates'"
+          class="timeline-scroll"
+          tabindex="0"
+          aria-label="时间线与交付滚动区域"
+        >
+          <CreationVersions
+            v-if="view === 'candidates'"
+            :snapshot="snapshot"
+            @created="runId = $event"
+            @refresh="refresh"
+          />
+          <ContinuationPreparation
+            v-if="view === 'candidates'"
+            :snapshot="snapshot"
+            @refresh="refresh"
+          />
+          <ProductionProgress
+            v-if="view === 'candidates'"
+            :snapshot="snapshot"
+            @scope="chooseScope"
+            @job="jobDetail = $event"
+            @prepare="prepare"
+          />
+          <ReferenceConfirmation
+            v-if="view === 'candidates'"
+            :snapshot="snapshot"
+            @refresh="refresh"
+          />
+          <DeliveryPlans v-if="view === 'timeline'" :snapshot="snapshot" @refresh="refresh" />
           <ReviewEditor
+            v-if="view === 'timeline'"
             :key="snapshot.run?.id"
             :snapshot="snapshot"
             :initial-candidate="candidateForEdit"
@@ -532,8 +740,9 @@ onBeforeUnmount(() => {
             saveLayout();
           "
         ></div>
+        <p class="field-hint">可在画布的 Agent 面板从当前内容启动自由制作。</p>
         <AssistantPanel
-          :episode-id="episodeId || undefined"
+          :episode-id="episodeId || snapshot.context?.episode?.id || undefined"
           :snapshot="snapshot"
           :references="discussionRefs"
           @remove-ref="discussionRefs.splice($event, 1)"
@@ -597,6 +806,7 @@ onBeforeUnmount(() => {
     />
     <AuthoringEditor
       v-if="editing && run"
+      :key="`${editing.record.id}:${editing.record.revision}:${editing.shotId || editing.sceneId || editing.subjectKey || 'all'}`"
       :record="editing.record"
       :run="run"
       :shot-id="editing.shotId"
@@ -646,8 +856,8 @@ onBeforeUnmount(() => {
         <details v-if="scopeWording.length" class="execution-wording">
           <summary>执行文案 · {{ scopeWording.length }} 项原文</summary>
           <p>
-            为 H3
-            准备英文执行描述。原故事、台词与时序保持原版本；留空沿用原文。保存的译文只适用于本次固定范围。
+            当前 H3 ComfyUI
+            方案要求英文执行描述；其他协议按所选方案检查语言。原故事、台词与时序保持原版本；留空沿用原文。保存的译文只适用于本次固定范围。
           </p>
           <div v-for="entry in scopeWording" :key="entry.path">
             <p>
@@ -681,10 +891,7 @@ onBeforeUnmount(() => {
           <h2>生成预览</h2>
           <button @click="executionPreview = null">×</button>
         </header>
-        <p>
-          范围 {{ rangeText }} · {{ snapshot.scope?.data.output.width }} ×
-          {{ snapshot.scope?.data.output.height }} · {{ snapshot.scope?.data.output.steps }} 步
-        </p>
+        <p>范围 {{ rangeText }}。各组实际使用的模型、协议参数和参考职责见下方固定预览。</p>
         <div class="reference-strip">
           <img
             v-for="item in snapshot.requirements.filter((r) => r.inScope && r.binding?.asset)"
@@ -694,7 +901,32 @@ onBeforeUnmount(() => {
           />
         </div>
         <p v-for="(issue, i) in executionPreview.issues || []" :key="i">{{ issue.message }}</p>
-        <p>本次准备不消耗额度。提交会按范围创建现有生产任务。</p>
+        <p>
+          本次准备不消耗额度。以下
+          {{ executionPreview.preview?.groups.length || 0 }}
+          组实际就绪，确认只提交这些固定输入；其他组继续等待。
+        </p>
+        <table>
+          <thead>
+            <tr>
+              <th>就绪组</th>
+              <th>请求秒数</th>
+              <th>模板</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="g in executionPreview.preview?.groups || []" :key="g.id">
+              <td>{{ g.id }}</td>
+              <td>{{ g.seconds }}</td>
+              <td>{{ g.template }}</td>
+            </tr>
+          </tbody>
+        </table>
+        <ExecutionInspection :preview="executionPreview" />
+        <details v-for="input in executionPreview.preview?.inputs || []" :key="input.segment.id">
+          <summary>{{ input.segment.id }} · 模型、Prompt 和实际输入</summary>
+          <GenerationPreview :input="input" />
+        </details>
         <details>
           <summary>固定输入、声音安排与能力检查</summary>
           <pre>{{ JSON.stringify(executionPreview, null, 2) }}</pre>
@@ -703,11 +935,7 @@ onBeforeUnmount(() => {
           <button @click="executionPreview = null">关闭</button
           ><button
             class="primary"
-            :disabled="
-              busy ||
-              snapshot.allowance.remainingGenerations <= 0 ||
-              !executionPreview.preview?.digest
-            "
+            :disabled="busy || !executionPreview.preview?.digest"
             @click="submit"
           >
             确认提交生成
@@ -752,11 +980,7 @@ onBeforeUnmount(() => {
           ><label class="check"
             ><input v-model="inspected" type="checkbox" />我已实际审看／听审此素材</label
           ><label>用途与审看结论<textarea v-model="bindingNote" rows="3" /></label
-          ><button
-            class="primary"
-            :disabled="busy || !inspected || !binding.id || !bindingNote.trim()"
-            @click="saveBinding"
-          >
+          ><button class="primary" :disabled="busy || !binding.id" @click="saveBinding">
             绑定这个版本
           </button></template
         >
@@ -790,5 +1014,6 @@ onBeforeUnmount(() => {
   <div v-else class="empty-state">
     <p>{{ error || '正在读取作品…' }}</p>
     <button v-if="error" @click="refresh">重新读取</button>
+    <button v-if="error" @click="clearPosition">清除工作位置并重新选择</button>
   </div>
 </template>

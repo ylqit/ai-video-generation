@@ -15,6 +15,7 @@ import { compileH3, ComfyClient } from './comfy.js';
 import { productionProgress } from './production.js';
 import { buildReviewEvaluation } from './review-evidence.js';
 import { versionRef } from '../shared/domain.js';
+import { hashFile } from './media.js';
 
 // Owns read-only media/capability checks. It never uploads or creates a job.
 export async function validateExecutionPreview(prepared: any, root: string) {
@@ -22,6 +23,11 @@ export async function validateExecutionPreview(prepared: any, root: string) {
   for (const a of prepared.input.assets) {
     const stat = await fs.stat(inside(root, a.asset.data.path)).catch(() => null);
     if (!stat?.isFile() || !stat.size) throw new HttpError(400, '参考文件缺失或为空');
+    if (
+      prepared.input.modelExecution &&
+      (await hashFile(inside(root, a.asset.data.path))) !== a.asset.data.sha256
+    )
+      throw new HttpError(409, '固定参考内容已变化，请重新准备');
     mappings.set(
       prepared.input.prepared
         ? `${a.reference.assetId}:${a.reference.revision}`
@@ -29,6 +35,17 @@ export async function validateExecutionPreview(prepared: any, root: string) {
       `studio_${a.asset.data.sha256}${path.extname(a.asset.data.path)}`,
     );
   }
+  if (prepared.input.modelExecution && prepared.input.modelExecution.protocol !== 'comfy-h3')
+    return {
+      ...prepared,
+      request: prepared.input.prepared.request,
+      validation: {
+        valid: true,
+        uploaded: false,
+        submitted: false,
+        verification: 'offline_contract',
+      },
+    };
   const graph = compileH3(prepared.input, mappings, 'preview');
   await new ComfyClient(prepared.input.profile.baseUrl).validate(graph);
   return { ...prepared, graph, validation: { valid: true, uploaded: false, submitted: false } };

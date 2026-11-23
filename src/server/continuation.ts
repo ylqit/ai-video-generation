@@ -15,6 +15,7 @@ export function prepareContinuation(store: Store, episode: any, segment: any) {
     }
     return result;
   }
+  const warnings: string[] = [];
   const incoming = segment.incoming,
     repair = segment.repair;
   const dependencies: { id: string; revision: number }[] = [];
@@ -26,15 +27,14 @@ export function prepareContinuation(store: Store, episode: any, segment: any) {
     if (
       doc.projectId !== episode.projectId ||
       doc.kind !== 'segment_selection' ||
-      !doc.data.boundary ||
-      doc.data.stale ||
-      (head.data.stale && !changedForRepair)
+      !doc.data.boundary
     )
-      throw new HttpError(409, '接续需要已审核采用区间的实际边界；旧采用请显式重新审核');
+      throw new HttpError(409, '此操作引用的实际片段或边界不存在，请选择素材区间');
     if (doc.parentId === episode.id && doc.data.segmentId === segment.id && !repair)
       throw new HttpError(400, '片段不能继承自身采用结果');
-    dependencies.push(ref, doc.data.video, doc.data.review);
-    for (const part of selectionMedia(doc.data)) dependencies.push(part.video, part.review);
+    dependencies.push(ref, doc.data.video, ...(doc.data.review ? [doc.data.review] : []));
+    for (const part of selectionMedia(doc.data))
+      dependencies.push(part.video, ...(part.review ? [part.review] : []));
     return { doc, head, changedForRepair };
   };
   let inherited: StateFact[] = [],
@@ -78,17 +78,17 @@ export function prepareContinuation(store: Store, episode: any, segment: any) {
       throw new HttpError(400, '接续必须声明需要的状态或关系');
     for (const d of incoming.decisions) {
       if (changed.keys.includes(`${d.instanceId}:${d.key}`))
-        throw new HttpError(409, `采用依据已改变：${d.instanceId}.${d.key}，请重新选择来源并审核`);
+        warnings.push(`采用依据已改变：${d.instanceId}.${d.key}，请重新选择来源并审核`);
       const fact = boundary.facts.find(
         (f: any) => f.instanceId === d.instanceId && f.key === d.key,
       );
       if (d.decision === 'inherit' && fact?.status !== 'known')
-        throw new HttpError(409, `来源边界未确认 ${d.instanceId}.${d.key}`);
+        warnings.push(`来源边界未确认 ${d.instanceId}.${d.key}`);
       const expected: StateFact = {
         instanceId: d.instanceId,
         key: d.key,
-        status: 'known',
-        value: d.decision === 'inherit' ? fact.value : d.value,
+        status: d.decision === 'inherit' && fact?.status !== 'known' ? 'unknown' : 'known',
+        value: d.decision === 'inherit' ? (fact?.status === 'known' ? fact.value : null) : d.value,
       };
       if (
         evaluateCondition(
@@ -96,12 +96,11 @@ export function prepareContinuation(store: Store, episode: any, segment: any) {
           first?.state?.attributes?.start || [],
         ) !== 'pass'
       )
-        throw new HttpError(409, `镜头起始状态与接续决策不符：${d.instanceId}.${d.key}`);
+        warnings.push(`镜头起始状态与接续决策不符：${d.instanceId}.${d.key}`);
       inherited.push(expected);
     }
     for (const d of incoming.relationDecisions) {
-      if (changed.objects.includes(d.objectId))
-        throw new HttpError(409, `采用关系已改变：${d.objectId}`);
+      if (changed.objects.includes(d.objectId)) warnings.push(`采用关系已改变：${d.objectId}`);
       const actual = boundary.relations.filter((r: any) => r.objectId === d.objectId);
       const planned = (first?.state?.startRelations || []).filter(
         (r: any) => r.objectId === d.objectId,
@@ -111,8 +110,8 @@ export function prepareContinuation(store: Store, episode: any, segment: any) {
         (!boundary.relationObjectIds?.includes(d.objectId) ||
           generationDigest(actual) !== generationDigest(planned))
       )
-        throw new HttpError(409, `持有、包含或数量关系未确认或不匹配：${d.objectId}`);
-      relations.push(...planned);
+        warnings.push(`持有、包含或数量关系未确认或不匹配：${d.objectId}`);
+      relations.push(...(d.decision === 'inherit' ? actual : planned));
     }
     snapshot = {
       selection: incoming.selection,
@@ -143,15 +142,16 @@ export function prepareContinuation(store: Store, episode: any, segment: any) {
           last?.state?.attributes?.end || [],
         ) !== 'pass'
       )
-        throw new HttpError(409, '修订目标结束状态必须进入最后镜头契约');
+        warnings.push('修订目标结束状态必须进入最后镜头契约');
   }
-  return { snapshot, dependencies, repair: repair || null };
+  return { snapshot, dependencies, repair: repair || null, warnings };
 }
 
 function prepareMultipleSources(store: Store, episode: any, segment: any) {
   const incoming = incomingV2Schema.parse(segment.incoming),
     first = episode.data.shots.find((s: any) => s.id === segment.shotIds[0]);
   if (first?.directing?.version !== 3) throw new HttpError(400, '多来源接续需要 directing v3');
+  const warnings: string[] = [];
   const dependencies: { id: string; revision: number }[] = [];
   const required = new Map<string, { instanceId: string; key: string; reason: string }>();
   for (const event of first.directing.events)
@@ -196,7 +196,8 @@ function prepareMultipleSources(store: Store, episode: any, segment: any) {
               episode.data.segments.findIndex((v: any) => v.id === segment.id)))
       )
         throw new HttpError(400, '普通接续不能引用未来片段或其他系列');
-      for (const p of selectionMedia(doc.data)) dependencies.push(p.video, p.review);
+      for (const p of selectionMedia(doc.data))
+        dependencies.push(p.video, ...(p.review ? [p.review] : []));
       const boundary = doc.data.boundary[s.boundary];
       return {
         id: s.id,
@@ -209,12 +210,12 @@ function prepareMultipleSources(store: Store, episode: any, segment: any) {
         actions: boundary.actions || [],
       };
     }
-    if (doc.data.schemaVersion !== 3 || !doc.data.confirmed)
+    if (![3, 4].includes(doc.data.schemaVersion) || !doc.data.confirmed)
       throw new HttpError(409, '需要已确认 Canon v3');
     if (incoming.mode !== 'historical') {
       const prior = predecessorCanon(store, episode).canon;
       if (!prior || prior.id !== doc.id || prior.revision !== doc.revision)
-        throw new HttpError(409, '普通接续必须引用直接前置 Canon');
+        warnings.push('普通接续必须引用直接前置 Canon');
     }
     return {
       id: s.id,
@@ -230,7 +231,7 @@ function prepareMultipleSources(store: Store, episode: any, segment: any) {
   dependencies.push(...sources.map((s) => s.ref));
   const keys = incoming.decisions.map((d) => `${d.instanceId}:${d.key}`);
   if (new Set(keys).size !== keys.length)
-    throw new HttpError(409, '多个来源对同一属性存在重复或冲突，必须明确选择');
+    warnings.push('多个来源对同一属性存在重复或冲突，必须明确选择');
   const facts: any[] = [],
     relations: any[] = [],
     actions: any[] = [];
@@ -240,17 +241,18 @@ function prepareMultipleSources(store: Store, episode: any, segment: any) {
     const actual = source?.facts.find((f: any) => f.instanceId === d.instanceId && f.key === d.key);
     if (d.decision === 'not_applicable') {
       if (required.has(`${d.instanceId}:${d.key}`))
-        throw new HttpError(409, '关键属性或动作前提不能设为不适用；先修改并审核要求');
+        warnings.push('关键属性或动作前提不能设为不适用；先修改并审核要求');
       continue;
     }
     if (d.decision === 'inherit' && actual?.status !== 'known')
-      throw new HttpError(409, `来源状态未知 ${d.instanceId}.${d.key}`);
+      warnings.push(`来源状态未知 ${d.instanceId}.${d.key}`);
     const competing = sources
       .flatMap((s) => s.facts)
       .filter((f: any) => f.instanceId === d.instanceId && f.key === d.key && f.status === 'known');
     if (new Set(competing.map((f: any) => generationDigest(f.value))).size > 1 && !d.reason.trim())
-      throw new HttpError(409, '多个来源的同一属性冲突，请说明选择依据');
-    const value = d.decision === 'inherit' ? actual.value : d.value;
+      warnings.push('多个来源的同一属性冲突，请说明选择依据');
+    const value =
+      d.decision === 'inherit' ? (actual?.status === 'known' ? actual.value : undefined) : d.value;
     if (
       value === undefined ||
       evaluateCondition(
@@ -258,15 +260,20 @@ function prepareMultipleSources(store: Store, episode: any, segment: any) {
         planned,
       ) !== 'pass'
     )
-      throw new HttpError(409, `起始状态与接续不符 ${d.instanceId}.${d.key}`);
-    facts.push({ instanceId: d.instanceId, key: d.key, status: 'known', value });
+      warnings.push(`起始状态与接续不符 ${d.instanceId}.${d.key}`);
+    facts.push({
+      instanceId: d.instanceId,
+      key: d.key,
+      status: value === undefined ? 'unknown' : 'known',
+      value: value === undefined ? null : value,
+    });
     if (source && d.decision === 'inherit' && source.doc.kind === 'segment_selection') {
       const change = boundaryChanges(
         source.doc.data.boundary,
         store.get(source.doc.id).data.boundary,
       )[source.side];
       if (change.keys.includes(`${d.instanceId}:${d.key}`))
-        throw new HttpError(409, '采用属性已改变，请重新选择来源');
+        warnings.push('采用属性已改变，请重新选择来源');
     }
   }
   for (const r of required.values())
@@ -278,7 +285,7 @@ function prepareMultipleSources(store: Store, episode: any, segment: any) {
         )
       )
         continue;
-      throw new HttpError(409, `缺少必查状态决策 ${r.instanceId}.${r.key}（${r.reason}）`);
+      warnings.push(`缺少必查状态决策 ${r.instanceId}.${r.key}（${r.reason}）`);
     }
   const relationIds = [
     ...new Set([
@@ -296,12 +303,12 @@ function prepareMultipleSources(store: Store, episode: any, segment: any) {
       incoming.mode !== 'independent' &&
       !incoming.relationDecisions.some((d) => d.objectId === id)
     )
-      throw new HttpError(409, `缺少必查关系 ${id}`);
+      warnings.push(`缺少必查关系 ${id}`);
   for (const d of incoming.relationDecisions) {
     const source = sources.find((s) => s.id === d.sourceId),
       expected = (first.state.startRelations || []).filter((r: any) => r.objectId === d.objectId);
     if (d.decision === 'not_applicable') {
-      if (relationIds.includes(d.objectId)) throw new HttpError(409, '关键关系不能省略');
+      if (relationIds.includes(d.objectId)) warnings.push('关键关系不能省略');
       continue;
     }
     if (
@@ -310,7 +317,7 @@ function prepareMultipleSources(store: Store, episode: any, segment: any) {
         generationDigest(expected) !==
           generationDigest(source.relations.filter((r: any) => r.objectId === d.objectId)))
     )
-      throw new HttpError(409, '继承关系未知或不匹配');
+      warnings.push('继承关系未知或不匹配');
     if (
       source?.doc.kind === 'segment_selection' &&
       d.decision === 'inherit' &&
@@ -318,8 +325,12 @@ function prepareMultipleSources(store: Store, episode: any, segment: any) {
         source.side
       ].objects.includes(d.objectId)
     )
-      throw new HttpError(409, '采用关系已改变，请重新选择来源');
-    relations.push(...expected);
+      warnings.push('采用关系已改变，请重新选择来源');
+    relations.push(
+      ...(d.decision === 'inherit'
+        ? source?.relations.filter((r: any) => r.objectId === d.objectId) || []
+        : expected),
+    );
   }
   const neededActions = [
     ...first.directing.carry.startActions,
@@ -340,7 +351,7 @@ function prepareMultipleSources(store: Store, episode: any, segment: any) {
       incoming.mode !== 'independent' &&
       !incoming.actionDecisions.some((d) => d.instanceId === a.instanceId && d.actionId === a.id)
     )
-      throw new HttpError(409, `未完成动作需要明确接续 ${a.id}`);
+      warnings.push(`未完成动作需要明确接续 ${a.id}`);
   for (const d of incoming.actionDecisions) {
     const actual = sources
       .find((s) => s.id === d.sourceId)
@@ -357,7 +368,7 @@ function prepareMultipleSources(store: Store, episode: any, segment: any) {
       !start ||
       (d.decision === 'inherit' ? !actual || start.phase !== actual.phase : start.phase !== d.phase)
     )
-      throw new HttpError(409, '动作阶段无法接续；需修改动作或明确时间省略');
+      warnings.push('动作阶段无法接续；需修改动作或明确时间省略');
     const source = sources.find((s) => s.id === d.sourceId);
     if (
       source?.doc.kind === 'segment_selection' &&
@@ -368,11 +379,12 @@ function prepareMultipleSources(store: Store, episode: any, segment: any) {
         ].actions || []
       ).includes(d.instanceId + ':' + d.actionId)
     )
-      throw new HttpError(409, '采用动作阶段已改变');
-    actions.push(start);
+      warnings.push('采用动作阶段已改变');
+    if (start) actions.push(start);
   }
   return {
     version: 2,
+    warnings,
     snapshot: {
       mode: incoming.mode,
       cut: incoming.cut,

@@ -1,14 +1,24 @@
 import { z } from 'zod';
 import { DeliveryService } from './delivery.js';
-import { creationCapabilities } from './capabilities.js';
+import { projectModelCapabilities } from './capabilities.js';
+import { ModelRegistry } from './model-registry.js';
 import { productionHead, activateProductionHead } from './creation-heads.js';
 import { Store, HttpError } from './db.js';
 import { StudioService } from './service.js';
 import { DomainService } from './domain-service.js';
 import { generationDigest } from './h3-guided.js';
 import { predecessorCanon } from './series-production.js';
+import {
+  effectiveEpisodePlan,
+  episodePredecessor,
+  assertEpisodePlanCurrent,
+} from './episode-plan.js';
+import { subjectBindingIssues } from './subject-bindings.js';
+import { adaptationIntentSchema, type AdaptationIntent } from '../shared/adaptation.js';
+import { validateAdaptationIntent, indexedSource } from './source-adaptation.js';
 import { authoringPrompt, authoringRegistry, authoringRules } from './creation-prompts.js';
 import { validateAuthoringResult } from '../shared/creation-validation.js';
+import { mergeLocalAuthoring } from '../shared/authoring-replacement.js';
 import { referenceCoverageBasis } from '../shared/reference-coverage.js';
 import {
   authoringSchemas,
@@ -61,7 +71,7 @@ export class CreationService {
         throw new HttpError(409, '运行版本或状态已变化');
       const results = this.adopted(run);
       if (['brief', 'script', 'direction', 'director', 'assets'].some((s) => !run.data.results[s]))
-        throw new HttpError(409, '请先确认全部前置专业阶段');
+        throw new HttpError(409, '专业制作头需要完整的前置结果；自由制作可以从画布开始');
       const scope = this.store.get(run.data.scope.id, run.data.scope.revision);
       const shots =
         results.director?.stage === 'director'
@@ -72,7 +82,7 @@ export class CreationService {
           requirementInScope(i, results.script as any, shots),
         )) {
           const binding = run.data.bindings[item.id];
-          if (!binding?.inspected || binding.requirementDigest !== generationDigest(item))
+          if (!binding || binding.requirementDigest !== generationDigest(item))
             throw new HttpError(409, `请先确认本次范围的实际参考：${item.id}`);
           if (
             binding.subjectDigest !==
@@ -80,7 +90,6 @@ export class CreationService {
           )
             throw new HttpError(409, '主体内容已变化，请重新确认参考');
           const asset = this.inputRecord(run.projectId, binding.asset);
-          if (!asset.data.adopted) throw new HttpError(409, '参考尚未实际采用');
         }
       }
       if (this.store.get(run.data.episodeId).revision !== run.data.targetRevision)
@@ -162,6 +171,20 @@ export class CreationService {
           generationDigest(old.data.policy.duration) !== generationDigest(policy.duration) ||
           generationDigest(old.data.policy.output) !== generationDigest(policy.output)
         ) {
+          if (run.data.effectivePlan?.series) {
+            const currentPlan = effectiveEpisodePlan(
+              this.store,
+              this.store.get(run.data.episodeId),
+            );
+            if (
+              generationDigest({ duration: currentPlan.duration, canvas: currentPlan.canvas }) ===
+              generationDigest({
+                duration: run.data.effectivePlan.duration,
+                canvas: run.data.effectivePlan.canvas,
+              })
+            )
+              continue;
+          }
           const current = initialStages.indexOf(run.data.stage);
           this.revise(
             run.id,
@@ -228,6 +251,7 @@ export class CreationService {
         request: z.string().trim().min(1).max(100000),
         episodeId: z.string().optional(),
         sources: z.array(creationRefSchema).max(100).default([]),
+        adaptation: adaptationIntentSchema.optional(),
         idempotencyKey: z.string().min(8),
       })
       .strict()
@@ -257,20 +281,38 @@ export class CreationService {
         ? service.owned(request.episodeId, projectId, 'episode')
         : service.createEpisode(projectId, { title: request.request.slice(0, 40) });
       for (const source of request.sources) this.inputRecord(projectId, source);
-      const inferred =
-        policy.duration.mode === 'derive' ? inferDurationIntent(request.request) : policy.duration;
+      if (request.adaptation)
+        validateAdaptationIntent(this.store, projectId, request.adaptation, request.sources);
+      if (
+        request.adaptation?.mode === 'faithful_adaptation' &&
+        !request.sources.length &&
+        !episode.data.script?.trim()
+      )
+        throw new HttpError(400, '忠实改编需要固定原文或本集已有剧本；从一句创意起步请选择原创');
+      const effectivePlan = effectiveEpisodePlan(this.store, episode, request.request);
       const run = this.store.create(
         'creation_run',
         projectId,
         {
           schemaVersion: 9,
+          productionRevision: 2,
+          adaptation: request.adaptation || {
+            version: 1,
+            mode: request.sources.length ? 'faithful_adaptation' : 'original',
+            preserve: [],
+            allow: [],
+            pending: [],
+            decisions: [],
+          },
+          subjectBindings: [],
           request: request.request,
           requestDigest: generationDigest(request),
           idempotencyKey: request.idempotencyKey,
           episodeId: episode.id,
           targetRevision: episode.revision,
           sources: request.sources,
-          duration: inferred,
+          duration: effectivePlan.duration,
+          effectivePlan,
           stage: 'brief',
           state: 'active',
           epoch: 1,
@@ -352,6 +394,14 @@ export class CreationService {
       throw new HttpError(409, '分集在其他编辑器中更新，请发送修订指令以重新读取');
     const settings = structuredClone(this.settings(run.projectId).data.policy) as CreationSettings;
     settings.duration = run.data.duration;
+    if (run.data.effectivePlan) {
+      assertEpisodePlanCurrent(this.store, run);
+      settings.output = {
+        ...settings.output,
+        width: run.data.effectivePlan.canvas.width,
+        height: run.data.effectivePlan.canvas.height,
+      };
+    }
     const all = this.adopted(run),
       priorResults: Partial<Record<AuthoringStage, AuthoringResult>> = {};
     for (const name of authoringRegistry[stage].predecessors) {
@@ -363,9 +413,12 @@ export class CreationService {
       .map((r: CreationRef) => this.inputRecord(run.projectId, r));
     for (const reference of Object.values(run.data.results) as CreationRef[])
       docs.push(this.inputRecord(run.projectId, reference));
+    for (const binding of run.data.subjectBindings || [])
+      if (binding.decision === 'reuse') docs.push(this.inputRecord(run.projectId, binding.entity));
     if (episode.data.seriesProduction) {
       const chain = predecessorCanon(this.store, episode, true);
       if (chain.canon) docs.push(chain.canon);
+      if (chain.story) docs.push(chain.story);
     }
     const profile = episode.data.seriesProduction ? this.store.get(episode.data.seriesId) : null;
     const profileRef = profile?.data.production?.profile;
@@ -388,7 +441,7 @@ export class CreationService {
         for (const part of group.parts)
           docs.push(
             this.inputRecord(run.projectId, part.video),
-            this.inputRecord(run.projectId, part.review),
+            ...(part.review ? [this.inputRecord(run.projectId, part.review)] : []),
           );
       }
       for (const cue of media.currentEdl?.data.audio || [])
@@ -416,7 +469,7 @@ export class CreationService {
               }
             : d.kind === 'creative_module'
               ? { name: d.data.name, category: d.data.category }
-              : d.data,
+              : indexedSource(this.store, d).data,
       }));
     records.push({
       id: episode.id,
@@ -452,11 +505,21 @@ export class CreationService {
       request: run.data.request,
       target: ref(episode),
       settings,
-      dependencies: unique.map(ref),
+      effectivePlan: run.data.effectivePlan,
+      predecessor: episodePredecessor(this.store, episode),
+      adaptation: run.data.adaptation,
+      subjectBindings: run.data.subjectBindings,
+      dependencies: [
+        ...unique.map(ref),
+        ...unique
+          .filter((d) => d.kind === 'source_index')
+          .flatMap((d) => d.data.entries.map((e: any) => e.source)),
+      ],
       records,
       priorResults,
       ...(run.data.writable?.stage === stage
         ? {
+            localProtocol: 'local-authoring-v1' as const,
             writable: {
               baseline: run.data.writable.baseline,
               baselineResult: this.store.get(
@@ -470,13 +533,24 @@ export class CreationService {
           }
         : {}),
       repairIssues,
-      rules: authoringRules(stage, modules),
-      capabilities: creationCapabilities(this.store),
+      rules: authoringRules(stage, modules, run.data.adaptation?.method),
+      capabilities: projectModelCapabilities(this.store, run.projectId, run.data.episodeId),
+      modelExecution:
+        new ModelRegistry(this.store).resolve(run.projectId, run.data.episodeId, 'text', stage) ||
+        undefined,
+      executionRevision: 1,
       digest: '',
     };
     if (authoringPrompt(context).length > 300000)
       throw new HttpError(400, '创作资料超出300000字符预算，请按分集缩小来源；未截断关键事实');
     context.contractRevision = 2;
+    for (const dependency of context.modelExecution?.dependencies || [])
+      if (
+        !context.dependencies.some(
+          (d) => d.id === dependency.id && d.revision === dependency.revision,
+        )
+      )
+        context.dependencies.push(dependency);
     context.digest = generationDigest({ ...context, digest: '' });
     return context;
   }
@@ -490,7 +564,16 @@ export class CreationService {
       context.digest !== generationDigest({ ...context, digest: '' })
     )
       throw new HttpError(400, '创作上下文摘要不匹配');
-    const parsed = authoringSchemas[context.stage].safeParse(raw);
+    let candidate = raw;
+    let replacementError = '';
+    if (context.localProtocol === 'local-authoring-v1' && (raw as any)?.protocol) {
+      try {
+        candidate = mergeLocalAuthoring(context, raw);
+      } catch (error: any) {
+        replacementError = error.message;
+      }
+    }
+    const parsed = authoringSchemas[context.stage].safeParse(candidate);
     const issues: CreationIssue[] = parsed.success
       ? validateAuthoringResult(parsed.data, context.priorResults, context.settings)
       : parsed.error.issues.map((i) => ({
@@ -502,6 +585,39 @@ export class CreationService {
           targetId: '',
           message: i.message,
         }));
+    if (replacementError)
+      issues.push({
+        code: 'local_replacement',
+        category: 'data',
+        severity: 'blocking',
+        stage: context.stage,
+        field: 'protocol',
+        targetId: '',
+        message: replacementError,
+      });
+    if (parsed.success && context.writable) {
+      try {
+        validateScopedRevision(
+          this.store,
+          {
+            ...run,
+            data: { ...run.data, writable: { ...context.writable, stage: context.stage } },
+          },
+          context.stage,
+          parsed.data,
+        );
+      } catch (error: any) {
+        issues.push({
+          code: 'local_scope',
+          category: 'data',
+          severity: 'blocking',
+          stage: context.stage,
+          field: 'writable',
+          targetId: '',
+          message: error.message,
+        });
+      }
+    }
     if (parsed.success)
       if (parsed.data.contractRevision !== 2)
         issues.push({
@@ -550,6 +666,9 @@ export class CreationService {
           adopted: false,
           stale: obsolete,
           jobId: job.id,
+          ...(context.localProtocol
+            ? { rawReplacement: raw, localProtocol: context.localProtocol }
+            : {}),
           epoch: context.epoch,
         },
         run.id,
@@ -592,7 +711,12 @@ export class CreationService {
         pendingJobId: null,
       });
       const context = this.context(id, stage);
-      return this.complete({ id: '', projectId: run.projectId, input: { context } } as Job, raw);
+      const saved = this.complete(
+        { id: '', projectId: run.projectId, input: { context } } as Job,
+        raw,
+      );
+      this.approve(id, saved.id, saved.revision, `save:${saved.id}:${saved.revision}`);
+      return this.store.get(saved.id);
     });
   }
   editResult(
@@ -640,6 +764,13 @@ export class CreationService {
           throw new HttpError(409, '确认键用于不同专业结果');
         return run;
       }
+      if (
+        doc.data.adopted &&
+        run.data.results?.[doc.data.stage]?.id === doc.id &&
+        run.data.results[doc.data.stage].revision === doc.revision &&
+        (revision === doc.revision || revision === doc.revision - 1)
+      )
+        return run;
       if (run.data.schemaVersion !== 9) throw new HttpError(409, '当前程序仅允许采用 V9 作者结果');
       if (
         run.data.paused ||
@@ -662,20 +793,24 @@ export class CreationService {
       }
       const parsed = authoringSchemas[doc.data.stage as AuthoringStage].safeParse(doc.data.result);
       if (!parsed.success) throw new HttpError(400, '结果结构尚未通过校验');
+      if (parsed.data.stage === 'script') {
+        const mappingIssues = subjectBindingIssues(this.store, run, parsed.data);
+        // Mapping suggestions do not prevent saving a script. Actual references are checked at preparation.
+        doc.data.mappingNotes = mappingIssues;
+      }
       validateScopedRevision(this.store, run, doc.data.stage, parsed.data);
       const issues = validateAuthoringResult(parsed.data, context.priorResults, context.settings);
       issues.push(...doc.data.issues.filter((i: CreationIssue) => i.code === 'invented_source'));
-      const blockers = issues.filter(
-        (i) => i.severity === 'blocking' && i.category !== 'execution',
-      );
+      const blockers = issues.filter((i) => i.severity === 'blocking' && i.category === 'data');
       if (blockers.length) throw new HttpError(409, blockers.map((i) => i.message).join('；'));
-      if (actor === 'agent' && parsed.data.openQuestions.length)
-        throw new HttpError(409, '存在需要用户选择的内容分歧');
       const accepted = this.store.update(doc.id, doc.revision, {
         ...doc.data,
         adopted: true,
         adoptedBy: actor,
         adoptedAt: Date.now(),
+        ...(parsed.data.stage === 'script' && run.data.subjectBindings
+          ? { subjectBindings: run.data.subjectBindings }
+          : {}),
       });
       new DomainService(this.store).dependencies(accepted, context.dependencies);
       const results = { ...run.data.results, [doc.data.stage]: ref(accepted) };
@@ -689,7 +824,7 @@ export class CreationService {
       const resultInvalidations = Object.entries(currentResults).flatMap(([stage, result]) => {
         if (stage === doc.data.stage) return [];
         const problems = validateAuthoringResult(result!, currentResults, context.settings).filter(
-          (i) => i.severity === 'blocking' && i.category !== 'execution',
+          (i) => i.severity === 'blocking' && i.category === 'data',
         );
         if (!problems.length) return [];
         const prior = (run.data.resultInvalidations || []).find(
@@ -761,14 +896,15 @@ export class CreationService {
                 shotIds: [],
                 groupIds: [],
                 output: scope.data.output,
+                continuations: scope.data.continuations,
               },
               scope.revision + 1,
             ),
           );
-          new DomainService(this.store).dependencies(
-            updated,
-            Object.values(updated.data.authoring),
-          );
+          new DomainService(this.store).dependencies(updated, [
+            ...(Object.values(updated.data.authoring) as CreationRef[]),
+            ...new DomainService(this.store).refs(updated.data.continuations || {}),
+          ]);
           next = this.store.update(next.id, next.revision, { ...next.data, scope: ref(updated) });
         }
       }
@@ -782,6 +918,7 @@ export class CreationService {
     sources: CreationRef[] = [],
     rebase = true,
     writable?: ScopedRevision,
+    adaptation?: AdaptationIntent,
   ) {
     return this.store.transaction(() => {
       const run = this.get(id),
@@ -851,12 +988,17 @@ export class CreationService {
           ? run.data.sources.map((r: CreationRef) => ref(this.store.get(r.id)))
           : run.data.sources;
       for (const source of references) this.inputRecord(run.projectId, source);
+      if (adaptation) validateAdaptationIntent(this.store, run.projectId, adaptation, references);
       const settings = this.settings(run.projectId).data.policy as CreationSettings;
+      const effectivePlan = run.data.effectivePlan
+        ? effectiveEpisodePlan(this.store, this.store.get(run.data.episodeId), request)
+        : null;
       const duration =
         settings.duration.mode === 'derive' ? inferDurationIntent(request) : settings.duration;
       return this.store.update(run.id, run.revision, {
         ...run.data,
         epoch: run.data.epoch + 1,
+        ...(adaptation ? { adaptation: adaptationIntentSchema.parse(adaptation) } : {}),
         stage,
         state: 'active',
         paused: false,
@@ -865,7 +1007,24 @@ export class CreationService {
         request: run.data.request + '\n\n用户修订：' + request,
         sources: references,
         results,
-        duration: duration.mode === 'derive' ? run.data.duration : duration,
+        duration: effectivePlan
+          ? effectivePlan.duration.mode === 'derive'
+            ? run.data.duration
+            : effectivePlan.duration
+          : duration.mode === 'derive'
+            ? run.data.duration
+            : duration,
+        ...(effectivePlan
+          ? {
+              effectivePlan: {
+                ...effectivePlan,
+                duration:
+                  effectivePlan.duration.mode === 'derive'
+                    ? run.data.duration
+                    : effectivePlan.duration,
+              },
+            }
+          : {}),
         targetRevision: this.store.get(run.data.episodeId).revision,
         messages: [...run.data.messages, { role: 'user', text: request, at: Date.now() }],
         materialized: stage === 'editorial' ? run.data.materialized : null,
@@ -908,7 +1067,12 @@ export class CreationService {
   }
   advance(id: string) {
     const run = this.get(id);
-    if (run.data.schemaVersion !== 9 || run.data.paused || run.data.state === 'complete')
+    if (
+      run.data.schemaVersion !== 9 ||
+      run.data.paused ||
+      run.data.progressOwner?.kind === 'assistant' ||
+      run.data.state === 'complete'
+    )
       return run;
     const director = run.data.results?.director;
     if (
@@ -977,18 +1141,16 @@ export class CreationService {
         const latest = candidates.at(-1);
         const errors =
           latest?.data.issues.filter(
-            (i: CreationIssue) => i.severity === 'blocking' && i.category !== 'execution',
+            (i: CreationIssue) => i.severity === 'blocking' && i.category === 'data',
           ) || [];
         if (latest && !errors.length && latest.data.valid) {
-          if (policy.progression === 'automatic' && !latest.data.result.openQuestions.length)
-            return this.approve(
-              id,
-              latest.id,
-              latest.revision,
-              `auto:${latest.id}:${latest.revision}`,
-              'agent',
-            );
-          return this.setIssues(id, latest.data.issues, 'awaiting_approval');
+          return this.approve(
+            id,
+            latest.id,
+            latest.revision,
+            `auto:${latest.id}:${latest.revision}`,
+            'agent',
+          );
         }
         if (latest && candidates.length > policy.maxTextRepairs)
           return this.setIssues(id, latest.data.issues, 'needs_revision');
@@ -1000,7 +1162,10 @@ export class CreationService {
             'creative',
             run.projectId,
             run.data.episodeId,
-            { context },
+            {
+              context,
+              ...(context.modelExecution ? { modelExecution: context.modelExecution } : {}),
+            },
             `creation:${id}:${run.data.epoch}:${stage}:${candidates.length}`,
           );
           return this.store.update(id, fresh.revision, {
@@ -1036,8 +1201,8 @@ export class CreationService {
         requirementId: z.string(),
         asset: creationRefSchema,
         asGroupStart: z.boolean().optional(),
-        inspected: z.literal(true),
-        conclusion: z.string().min(1),
+        inspected: z.boolean().default(false),
+        conclusion: z.string().default(''),
         revision: z.number().int().positive(),
       })
       .strict()
@@ -1074,8 +1239,8 @@ export class CreationService {
         groupStart = { groupId: group.id, shotId: group.shotIds[0] };
       }
       const asset = this.inputRecord(run.projectId, input.asset);
-      if (asset.kind !== 'asset' || asset.data.mediaType !== item.mediaType || !asset.data.adopted)
-        throw new HttpError(400, '请先在资产库审核并采用相应图片或音频，再绑定其精确版本');
+      if (asset.kind !== 'asset' || asset.data.mediaType !== item.mediaType)
+        throw new HttpError(400, '绑定素材的类型与需求不符，请选择对应图片或音频版本');
       const script = this.adopted(run).script;
       const director = this.adopted(run).director;
       const subject =
@@ -1094,7 +1259,7 @@ export class CreationService {
               director?.stage === 'director'
                 ? generationDigest(referenceCoverageBasis(director, item.coverage || []))
                 : null,
-            inspected: true,
+            inspected: input.inspected,
             conclusion: input.conclusion,
             at: Date.now(),
             reviewer: actor,

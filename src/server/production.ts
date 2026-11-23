@@ -39,16 +39,10 @@ export function productionProgress(store: Store, episodeId: string) {
     const selection = selectionBySegment.get(segment.id);
     const actualJob =
       selection && attempts.find((j) => j.id === selection.data.jobId && j.state === 'succeeded');
-    let validSelection: RecordDoc | undefined;
-    if (selection && actualJob) {
-      const review = store.get(selection.data.review.id, selection.data.review.revision);
-      if (review.data.inspected && !store.get(review.id).data.stale) validSelection = selection;
-    }
+    const validSelection = selection && actualJob ? selection : undefined;
     let waitingReason = '';
     if (!validSelection)
       try {
-        if (!episode.data.approved || episode.data.stale)
-          throw new HttpError(409, '分集需要先审核');
         readiness.generation(
           {
             episodeId,

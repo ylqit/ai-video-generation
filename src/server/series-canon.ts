@@ -5,18 +5,13 @@ import { fixedSeriesRecord, predecessorCanon, resolveSeries } from './series-pro
 import { generationDigest } from './h3-guided.js';
 
 // Validates a proposed factual change set against actual adopted evidence. Publication is
-// owned by the release transaction, never by planning, a model response, or a preview.
+// an explicit media-fact action, independently from release or authored story changes.
 export function prepareCanonV3(store: Store, ep: any, raw: unknown) {
   const data = canonV3Schema.parse(raw),
     { series, production } = resolveSeries(store, ep),
     prior = predecessorCanon(store, ep).canon;
-  if (
-    data.episode.id !== ep.id ||
-    data.episode.revision !== ep.revision ||
-    !ep.data.approved ||
-    ep.data.stale
-  )
-    throw new HttpError(409, '剧情确认需要当前已审核分集');
+  if (data.episode.id !== ep.id || data.episode.revision !== ep.revision)
+    throw new HttpError(409, '剧情确认需要当前分集版本');
   if (
     generationDigest(data.previous) !==
     generationDigest(prior ? { id: prior.id, revision: prior.revision } : null)
@@ -85,6 +80,8 @@ export function prepareCanonV3(store: Store, ep: any, raw: unknown) {
       if (segment?.incoming?.mode === 'historical' && f.kind === 'world_fact')
         throw new HttpError(409, '历史镜头不能改写当前世界状态');
       const entries = selectionMedia(selection.data).flatMap((part) => {
+        if (!part.review)
+          throw new HttpError(400, '此媒体尚无观察证据；可保存剧情依据，但不能声称已在画面呈现');
         const review = fixedSeriesRecord(store, ep.projectId, part.review, 'generation_review');
         dependencies.push(part.review, part.video);
         return [

@@ -1,3 +1,6 @@
+import { repairSourceUnchanged } from './selection-splice.js';
+import { saveStoryBasis } from './story-basis.js';
+import { prepareCanonV3 } from './series-canon.js';
 import { validateIssueTarget } from './review-evidence.js';
 import { productionHead } from './creation-heads.js';
 import { resolveCreativeBrief } from './creative-brief.js';
@@ -28,6 +31,7 @@ import { boundaryChanges, correctionAffectsInput } from './generation-dependenci
 import { repairWindow, selectionMedia, spliceSelection } from './selection-splice.js';
 import { prepareContinuation } from './continuation.js';
 import { canonSourceProblems } from './series-production.js';
+import { VoiceLibrary } from './voice-library.js';
 
 // Owns project-domain validation, review publication, dependency tracking and copying.
 // It never executes a model; corrections only mark existing result review metadata.
@@ -55,7 +59,8 @@ export class DomainService {
         result.push({ id: value.id, revision: value.revision });
         return;
       }
-      for (const child of Object.values(value)) visit(child);
+      // Global voice identity has its own immutable library history.
+      for (const [key, child] of Object.entries(value)) if (key !== 'globalVoice') visit(child);
     };
     visit(data);
     return [...new Map(result.map((r) => [`${r.id}:${r.revision}`, r])).values()];
@@ -120,6 +125,8 @@ export class DomainService {
         ? creationProfileSchema.parse(raw)
         : domainSchemas[kind].parse(raw);
     const old = id ? this.store.get(id) : null;
+    if (kind === 'voice_profile' && data.version === 2)
+      new VoiceLibrary(this.store).voice(data.globalVoice.id, data.globalVoice.revision);
     if (old && (old.kind !== kind || old.projectId !== projectId))
       throw new HttpError(400, '记录不属于本项目或类型不匹配');
     if (old?.kind === 'layout' && old.data.creationSource)
@@ -188,14 +195,12 @@ export class DomainService {
     if (kind === 'reference_pack')
       for (const view of data.views) {
         const asset = this.owned(projectId, view.asset, 'asset');
-        if (asset.data.mediaType !== 'image' || !asset.data.adopted)
-          throw new HttpError(400, '参考包需要已采用的图片版本');
+        if (asset.data.mediaType !== 'image') throw new HttpError(400, '参考包必须引用图片版本');
       }
     if (kind === 'asset_task')
       for (const ref of data.references) {
         const asset = this.owned(projectId, ref, 'asset');
-        if (!asset.data.adopted || asset.data.mediaType !== 'image')
-          throw new HttpError(400, '制作任务参考必须是已采用图片');
+        if (asset.data.mediaType !== 'image') throw new HttpError(400, '制作任务参考必须是图片');
       }
     if (kind === 'reference_pack' || kind === 'asset_task')
       this.validateRelations(data.relations, this.instanceMap(projectId));
@@ -228,12 +233,10 @@ export class DomainService {
         throw new HttpError(400, '图片绑定 ID 重复');
       for (const b of data.bindings) {
         const asset = this.owned(projectId, b.asset, 'asset');
-        if (!asset.data.adopted || asset.data.mediaType !== 'image')
-          throw new HttpError(400, '参考方案需要已采用图片');
+        if (asset.data.mediaType !== 'image') throw new HttpError(400, '参考方案必须引用图片');
         if (b.pack) {
           const pack = this.owned(projectId, b.pack, 'reference_pack');
           if (
-            !pack.data.published ||
             !pack.data.views.some(
               (v: any) =>
                 v.asset.id === b.asset.id &&
@@ -291,7 +294,7 @@ export class DomainService {
   }
   publish(id: string, revision: number, raw: unknown) {
     const review = z
-      .object({ inspected: z.literal(true), conclusion: z.string().min(1) })
+      .object({ inspected: z.boolean().default(false), conclusion: z.string().default('') })
       .parse(raw);
     const doc = this.store.get(id);
     if (
@@ -304,7 +307,6 @@ export class DomainService {
       ].includes(doc.kind)
     )
       throw new HttpError(400, '此记录类型不支持发布；可发布参考包、参考方案、创作模块或创作配置');
-    if (doc.data.stale) throw new HttpError(409, '依据已纠正，请重新保存并审核');
     for (const ref of this.refs(doc.data)) this.owned(doc.projectId, ref);
     if (
       doc.kind === 'creation_profile' &&
@@ -317,22 +319,17 @@ export class DomainService {
       if (blockers.length) throw new HttpError(409, blockers.map((c) => c.message).join('；'));
     }
     if (doc.kind === 'voice_profile') {
-      for (const sample of doc.data.samples) {
-        const audio = this.owned(doc.projectId, sample.asset, 'asset');
-        if (
-          !audio.data.adopted ||
-          audio.data.mediaType !== 'audio' ||
-          sample.out > audio.data.duration
-        )
-          throw new HttpError(400, '声音参考需要已采用音频及真实听审区间');
+      if (doc.data.version === 2) {
+        const voice = new VoiceLibrary(this.store).voice(
+          doc.data.globalVoice.id,
+          doc.data.globalVoice.revision,
+        );
       }
-    }
-    if (doc.kind === 'reference_pack') {
-      for (const view of doc.data.views)
-        if (!this.owned(doc.projectId, view.asset, 'asset').data.adopted)
-          throw new HttpError(400, '参考包包含尚未采用的图片版本');
-      if (doc.data.relations.some((r: any) => !r.confirmed))
-        throw new HttpError(400, '参考包关系尚未确认');
+      for (const sample of doc.data.samples || []) {
+        const audio = this.owned(doc.projectId, sample.asset, 'asset');
+        if (audio.data.mediaType !== 'audio' || sample.out > audio.data.duration)
+          throw new HttpError(400, '声音参考必须是音频，且区间不能超出媒体');
+      }
     }
     return this.store.transaction(() => {
       const next = this.store.update(id, revision, {
@@ -587,11 +584,8 @@ export class DomainService {
         ].includes(doc.kind)
       )
         throw new HttpError(400, '模板只能包含主体、外观、参考包、布局和图片');
-      if (
-        (['reference_pack', 'creative_module'].includes(doc.kind) && !doc.data.published) ||
-        (doc.kind === 'asset' && (!doc.data.adopted || doc.data.mediaType !== 'image'))
-      )
-        throw new HttpError(400, '模板需要已审核参考包和已采用图片');
+      if (doc.kind === 'asset' && doc.data.mediaType !== 'image')
+        throw new HttpError(400, '模板素材需要固定图片');
       docs.set(key, doc);
       queue.push(...this.refs(doc.data));
       // Relations may target another reusable entity: include it explicitly in the bundle.
@@ -633,6 +627,8 @@ export class DomainService {
   copyLibrary(projectId: string, id: string, revision: number) {
     if (this.store.get(projectId).kind !== 'project') throw new HttpError(400, '不是项目');
     const bundle = this.library(id, revision);
+    if (bundle.kind === 'global_voice' || bundle.kind === 'voice_media')
+      throw new HttpError(400, '全局声音请通过作品选用入口固定版本');
     const mapping = new Map<string, string>(),
       instances = new Map<string, string>();
     for (const doc of bundle.documents) {
@@ -715,6 +711,8 @@ export class DomainService {
     if (data.out <= data.in || data.out > video.data.duration + 0.04)
       throw new HttpError(400, '审核区间越界');
     const evaluation = buildReviewEvaluation(this.store, projectId, job, data.observationBasis);
+    if (job.kind === 'lipsync' && !evaluation)
+      throw new HttpError(409, '口型派生候选需要以当前镜头重新建立观察审核，不能继承原片结论');
     const reviewSpecs = evaluation?.shotSpecs || job.input.prepared?.shotSpecs || [];
     validateObservedReview(
       evaluation
@@ -815,175 +813,76 @@ export class DomainService {
     });
   }
   select(projectId: string, raw: unknown, expected?: number) {
-    const data = selectionSchema.parse(raw),
-      ep = this.owned(projectId, data.episode, 'episode');
-    if (this.store.get(ep.id).revision !== ep.revision || !ep.data.approved || ep.data.stale)
-      throw new HttpError(409, '先审核当前分集');
-    const job = this.store.job(data.jobId),
-      video = this.owned(projectId, data.video, 'asset'),
-      review = this.owned(projectId, data.review, 'generation_review');
+    const data = selectionSchema.parse(raw);
+    const ep = this.owned(projectId, data.episode, 'episode');
+    if (this.store.get(ep.id).revision !== ep.revision)
+      throw new HttpError(409, '分集版本已变化，请刷新后选用');
+    const job = this.store.job(data.jobId);
+    const video = this.owned(projectId, data.video, 'asset');
     if (
       job.projectId !== projectId ||
-      job.episodeId !== ep.id ||
-      job.input.segment?.id !== data.segmentId ||
       job.state !== 'succeeded' ||
       video.data.jobId !== job.id ||
-      !video.data.adopted
+      video.data.mediaType !== 'video'
     )
-      throw new HttpError(400, '候选与片段不匹配或素材未采用');
-    if (
-      review.data.jobId !== job.id ||
-      review.data.video.id !== video.id ||
-      review.data.video.revision !== video.revision ||
-      this.store.get(review.id).revision !== review.revision ||
-      review.data.stale
-    )
-      throw new HttpError(409, '候选审核已变化');
-    if (data.in < review.data.in || data.out > review.data.out || data.out <= data.in)
-      throw new HttpError(400, '选择区间需要完整审核覆盖');
-    if (
-      Object.values(review.data.dimensions).includes('unreviewed') ||
-      review.data.issues.some(
-        (i: any) =>
-          i.severity === 'blocking' && i.frameIndex / 24 >= data.in && i.frameIndex / 24 < data.out,
-      )
-    )
-      throw new HttpError(409, '存在未检查维度或阻断问题');
+      throw new HttpError(400, '需要本作品真实归档的视频候选');
+    const segment = ep.data.segments.find((v: any) => v.id === data.segmentId);
+    if (!segment) throw new HttpError(400, '目标片段不存在');
+    if (job.episodeId && (job.episodeId !== ep.id || job.input.segment?.id !== segment.id))
+      throw new HttpError(400, '候选不属于目标片段；独立试作请使用关联入口');
     const head = productionHead(this.store, ep.id);
-    if (head.conflict) throw new HttpError(409, '当前制作归属有冲突，请先显式激活');
-    if (head.runId && job.input.creationRunId !== head.runId)
-      throw new HttpError(409, '候选不属于当前制作版本');
-    const directedShots = review.data.evaluation?.shotSpecs || job.input.prepared?.shotSpecs || [];
-    const universal = directedShots.some((s: any) => s.version >= 2);
-    if (universal) {
-      const current = ep.data.segments.find((s: any) => s.id === data.segmentId);
-      const currentShots =
-        current?.shotIds.map((id: string) => ep.data.shots.find((s: any) => s.id === id)) || [];
-      if (review.data.evaluation) {
-        const evaluation = buildReviewEvaluation(
-          this.store,
-          projectId,
-          job,
-          review.data.observationBasis,
-        );
-        if (generationDigest(evaluation) !== generationDigest(review.data.evaluation))
-          throw new HttpError(409, '生成后审核依据已变化');
-      } else if (
-        generationDigest(current) !== generationDigest(job.input.segment) ||
-        generationDigest(currentShots) !== generationDigest(job.input.planning.shots)
-      )
-        throw new HttpError(409, '本片段契约已变化，旧候选不能绕过新版要求重新采用');
-      const corrections = this.store.db
-        .prepare("SELECT seq,data FROM events WHERE kind='domain_correction' AND created_at>=?")
-        .all(job.createdAt);
-      if (
-        corrections.some(
-          (e) =>
-            correctionAffectsInput(job.input, JSON.parse(String(e.data)), job.id) &&
-            !review.data.correctionBasis?.includes(Number(e.seq)),
-        )
-      )
-        throw new HttpError(409, '任务依据被纠正，需在纠正之后重新审核候选');
-    }
+    if (head.conflict) throw new HttpError(409, '当前制作归属有冲突');
+    if (head.runId && job.input.creationRunId && job.input.creationRunId !== head.runId)
+      throw new HttpError(409, '候选属于其他创作版本，请先关联到当前镜头');
+    const frames = video.data.frameCount || Math.floor(video.data.duration * 24);
     if (
-      universal &&
-      ([data.in, data.out, ...data.coverage.flatMap((c) => [c.in, c.out])].some(
-        (v) => Math.abs(v * 24 - Math.round(v * 24)) > 1e-6,
-      ) ||
-        Math.round(data.out * 24) > video.data.frameCount)
+      data.out <= data.in ||
+      Math.round(data.out * 24) > frames ||
+      [data.in, data.out].some((v) => Math.abs(v * 24 - Math.round(v * 24)) > 1e-6)
     )
-      throw new HttpError(400, '新版采用使用实际媒体整帧范围');
-    let offset = 0;
-    for (const spec of directedShots) {
-      const coverage = data.coverage.find((c) => c.shotId === spec.shotId);
-      if (!coverage) throw new HttpError(400, '缺少镜头区间');
-      const problems =
-        spec.version >= 2
-          ? auditShotSemantics(spec, review.data, coverage, offset)
-          : eventCoverageIssues(
-              spec.directing?.events || [],
-              (review.data.eventEvidence || []).filter((e: any) => e.shotId === spec.shotId),
-              Math.round(coverage.in * 24),
-              Math.round(coverage.out * 24),
-            );
-      offset += spec.frames;
-      if (problems.length) throw new HttpError(409, problems.join('；'));
-    }
-    if (job.input.planning?.mode === 'exploration') {
-      const shots = ep.data.shots.filter((s: any) => job.input.segment.shotIds.includes(s.id));
-      if (this.shotChecks(projectId, shots).length)
-        throw new HttpError(409, '探索候选转正式采用前，须完成本镜头状态和关系确认');
-      for (const shot of shots)
-        for (const i of shot.state.instances) {
-          if (!i.pack) throw new HttpError(409, '探索候选采用前需要正式参考包');
-          const pack = this.owned(projectId, i.pack, 'reference_pack');
-          if (
-            !pack.data.published ||
-            pack.data.stale ||
-            shot.state.requiredViews.some(
-              (v: any) =>
-                v.instanceId === i.instanceId &&
-                !pack.data.views.some((p: any) => !p.overviewOnly && p.view === v.view),
-            )
-          )
-            throw new HttpError(409, '探索候选采用前需要完成必需视图审核');
-        }
-    }
-    const segment = ep.data.segments.find((s: any) => s.id === data.segmentId);
+      throw new HttpError(400, '选用区间必须在实际媒体的整帧范围内');
     if (
-      !segment ||
-      data.coverage.length !== segment.shotIds.length ||
-      new Set(data.coverage.map((c) => c.shotId)).size !== data.coverage.length
-    )
-      throw new HttpError(400, '镜头覆盖清单不完整或重复');
-    let cursor = data.in;
-    for (const [index, c] of data.coverage.entries()) {
-      if (
-        !segment.shotIds.includes(c.shotId) ||
-        (universal && segment.shotIds[index] !== c.shotId) ||
-        Math.abs(c.in - cursor) > 0.001 ||
-        c.out <= c.in ||
-        c.out > data.out
+      new Set(data.coverage.map((c) => c.shotId)).size !== data.coverage.length ||
+      data.coverage.some(
+        (c) =>
+          !segment.shotIds.includes(c.shotId) ||
+          c.in < data.in ||
+          c.out > data.out ||
+          c.out <= c.in,
       )
-        throw new HttpError(400, '镜头区间必须按顺序连续覆盖选择区间');
-      cursor = c.out;
-    }
-    if (Math.abs(cursor - data.out) > 0.001) throw new HttpError(400, '镜头区间未覆盖完整选择');
-    const boundary = universal ? selectedBoundary(directedShots, review.data, data) : null;
+    )
+      throw new HttpError(400, '镜头映射重复、引用无效或超出选用区间');
+    const review = data.review ? this.owned(projectId, data.review, 'generation_review') : null;
+    if (
+      review &&
+      (review.data.jobId !== job.id ||
+        review.data.video.id !== video.id ||
+        review.data.video.revision !== video.revision)
+    )
+      throw new HttpError(400, '观察记录必须属于本次媒体版本');
+    // Selection is an editing decision, never an invented quality verdict. Only actual
+    // observations from a still-valid optional review can populate boundary facts.
+    const observed = review && !this.store.get(review.id).data.stale ? review.data : {};
+    const specs = observed.evaluation?.shotSpecs || job.input.prepared?.shotSpecs || [];
+    const boundary = selectedBoundary(specs.length ? specs : [{}], observed, data);
     let replacement: any = null;
-    if (universal && job.input.segment.repair) {
-      const repair = job.input.segment.repair;
-      prepareContinuation(this.store, ep, job.input.segment);
+    const repair = job.input.segment?.repair;
+    if (repair) {
       const source = this.owned(projectId, repair.sourceSelection, 'segment_selection');
+      const current = this.store
+        .list('segment_selection', projectId)
+        .find((d) => d.parentId === ep.id && d.data.segmentId === data.segmentId);
       if (
-        source.id !==
-        this.store
-          .list('segment_selection', projectId)
-          .find((s) => s.parentId === ep.id && s.data.segmentId === data.segmentId)?.id
+        current?.id !== source.id ||
+        (current.revision !== source.revision && !repairSourceUnchanged(source, current))
       )
-        throw new HttpError(409, '替换需要当前片段的固定采用版本');
-      const window = repairWindow(source.data, repair);
+        throw new HttpError(409, '替换来源已变化，请重新选择固定区间');
+      repairWindow(source.data, repair);
       if (
-        boundary!.startFrame !== repair.adoptRange.startFrame ||
-        boundary!.endFrame !== repair.adoptRange.endFrame
+        boundary.startFrame !== repair.adoptRange.startFrame ||
+        boundary.endFrame !== repair.adoptRange.endFrame
       )
-        throw new HttpError(409, '修订候选必须采用已审核的替换范围；更改范围需要新修订方案');
-      for (const side of ['before', 'after'])
-        if (
-          repair[side === 'before' ? 'checkBefore' : 'checkAfter'] ||
-          (side === 'before' ? window.start > 0 : window.end < window.frames)
-        )
-          for (const inspection of ['motion', 'audio'])
-            if (
-              !(review.data.spliceEvidence || []).some(
-                (e: any) =>
-                  e.side === side &&
-                  e.inspection === inspection &&
-                  e.status === 'pass' &&
-                  generationDigest(e.sourceSelection) === generationDigest(repair.sourceSelection),
-              )
-            )
-              throw new HttpError(409, `修订 ${side} 侧缺少 ${inspection} 接续审核`);
+        throw new HttpError(400, '替换区间与当前修订输入不一致');
       replacement = spliceSelection(source, repair, data, boundary);
     }
     return this.store.transaction(() => {
@@ -994,10 +893,13 @@ export class DomainService {
         .find((d) => d.parentId === ep.id && d.data.segmentId === data.segmentId);
       const payload = {
         ...data,
+        review: data.review || null,
         ...(head.runId ? { creationRunId: head.runId } : {}),
-        schemaVersion: universal ? 3 : 2,
+        schemaVersion: 4,
         stale: false,
-        ...(boundary ? { boundary, dependencies: job.input.dependencies } : {}),
+        quality: review ? 'observations_available' : 'unobserved',
+        boundary,
+        dependencies: job.input.dependencies || [],
         ...(replacement || {}),
       };
       const doc = old
@@ -1006,21 +908,18 @@ export class DomainService {
       this.dependencies(doc, [
         data.episode,
         data.video,
-        data.review,
+        ...(data.review ? [data.review] : []),
         ...(job.input.dependencies || []),
-        ...selectionMedia(payload).flatMap((p) => [p.video, p.review]),
+        ...selectionMedia(payload).flatMap((p) => [p.video, ...(p.review ? [p.review] : [])]),
       ]);
-      if (old?.data.boundary && boundary) {
-        const selectionChange = boundaryChanges(old.data.boundary, payload.boundary);
-        const correction = {
+      if (old?.data.boundary)
+        this.propagateSelectionCorrection(projectId, {
           source: old.id,
           affected: [],
-          selectionChange,
-          reason: '采用边界状态变化',
+          selectionChange: boundaryChanges(old.data.boundary, payload.boundary),
+          reason: '选用范围或边界依据变化',
           supersedingJobId: job.id,
-        };
-        this.propagateSelectionCorrection(projectId, correction);
-      }
+        });
       return doc;
     });
   }
@@ -1097,8 +996,7 @@ export class DomainService {
       const selection = this.store
         .list('segment_selection', projectId)
         .find((d) => d.parentId === ep.id && d.data.segmentId === s.id);
-      if (!selection || selection.data.stale)
-        throw new HttpError(409, `片段 ${s.id} 尚未采用或需复核`);
+      if (!selection) throw new HttpError(409, `片段 ${s.id} 尚未选用`);
       return selection;
     });
     if (!selections.length) throw new HttpError(400, '没有可装配片段');
@@ -1108,7 +1006,7 @@ export class DomainService {
         [s.data.in, s.data.out].some((v) => Math.abs(v * 24 - Math.round(v * 24)) > 1e-6),
       )
     )
-      throw new HttpError(409, '长片装配需要在候选审核中确认整帧入出点');
+      throw new HttpError(409, '装配需要有效的整帧入出点');
     return {
       ...(ep.data.dramaturgy || ep.data.seriesProduction ? { schemaVersion: 2 } : {}),
       episodeId,
@@ -1130,14 +1028,24 @@ export class DomainService {
   }
   confirmCanon(projectId: string, raw: unknown, expected?: number) {
     const input = raw as any;
-    if (
-      input.schemaVersion === 3 ||
-      (input.episode?.id && this.store.get(input.episode.id).data.seriesProduction)
-    )
-      throw new HttpError(409, 'V7 Canon 必须通过整集交付确认');
+    if (input.schemaVersion === 4)
+      return { document: saveStoryBasis(this.store, projectId, raw, expected), affected: [] };
+    if (input.schemaVersion === 3)
+      return this.store.transaction(() => {
+        const ep = this.owned(projectId, input.episode, 'episode');
+        const prepared = prepareCanonV3(this.store, ep, raw);
+        const old = this.store
+          .list('continuity', projectId, ep.id)
+          .find((c) => c.data.schemaVersion === 3);
+        const document = old
+          ? this.store.update(old.id, expected ?? -1, prepared.data)
+          : this.store.create('continuity', projectId, prepared.data, ep.id);
+        this.dependencies(document, prepared.dependencies);
+        return { document, affected: old ? this.impact(old.id, true, '媒体观察依据更新') : [] };
+      });
     const data = canonSchema.parse(raw),
       ep = this.owned(projectId, data.episode, 'episode');
-    if (this.store.get(ep.id).revision !== ep.revision || !ep.data.approved || ep.data.stale)
+    if (this.store.get(ep.id).revision !== ep.revision)
       throw new HttpError(409, '请先确认当前分集');
     const existing = this.store
       .list('continuity', projectId)

@@ -2,6 +2,7 @@
 import { computed, ref } from 'vue';
 import type { WorkspaceSnapshot } from '../shared/workspace';
 import { assetUrl } from './api';
+import StoryboardRehearsal from './StoryboardRehearsal.vue';
 const props = defineProps<{ snapshot: WorkspaceSnapshot }>();
 const emit = defineEmits(['preview', 'edit', 'scope', 'candidate', 'discuss', 'handoff']);
 const mode = ref('cards'),
@@ -43,6 +44,7 @@ function toggleAll() {
 
 <template>
   <section class="storyboard-view">
+    <StoryboardRehearsal :snapshot="snapshot" />
     <header class="view-toolbar">
       <div class="segmented">
         <button :class="{ active: mode === 'cards' }" @click="mode = 'cards'">镜头卡</button
@@ -88,7 +90,17 @@ function toggleAll() {
           />
           <div v-else>
             <span>▧</span>
-            <p>构图参考待制作</p>
+            <p>
+              {{
+                shot.requirements.some((r: any) =>
+                  ['composition', 'action_start'].includes(r.purpose),
+                )
+                  ? '执行要求的构图参考待准备'
+                  : shot.interactions?.some((i: any) => i.required)
+                    ? '可补充交互构图参考'
+                    : '当前方案不要求构图图'
+              }}
+            </p>
             <small>故事规划已保存 · 未生成</small>
           </div>
         </div>
@@ -105,6 +117,14 @@ function toggleAll() {
             <p v-if="line.translation" class="translation">{{ line.translation }}</p>
           </blockquote>
           <dl>
+            <dt>镜头任务</dt>
+            <dd>{{ shot.purpose }}</dd>
+            <dt>观众注意</dt>
+            <dd>{{ shot.audienceFocus || '未声明' }}</dd>
+            <dt>信息变化</dt>
+            <dd>{{ shot.informationChange || '未声明' }}</dd>
+            <dt>切出理由</dt>
+            <dd>{{ shot.cutReason || '未声明' }}</dd>
             <dt>机位</dt>
             <dd>
               {{ shot.camera.shotSize }} · {{ shot.camera.position }} ·

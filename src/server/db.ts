@@ -4,6 +4,9 @@ import { migrateDatabase } from './migrations.js';
 import type { Kind, RecordDoc, Job, JobState } from '../shared/contracts.js';
 import { creationSettingsSchema } from '../shared/creation.js';
 import { createHash } from 'node:crypto';
+import { reserveModelUsage } from './model-usage.js';
+import { reserveSpeechUsage } from './speech-usage.js';
+import { reserveAssistantUsage } from './assistant-usage.js';
 export class HttpError extends Error {
   constructor(
     public status: number,
@@ -71,12 +74,19 @@ export class Store {
     if (!row) throw new HttpError(404, '记录不存在');
     return revision ? JSON.parse(row.document as string) : this.decode(row);
   }
-  list(kind?: Kind, projectId?: string): RecordDoc[] {
+  list(kind?: Kind, projectId?: string, parentId?: string): RecordDoc[] {
     return this.db
       .prepare(
-        'SELECT * FROM documents WHERE (? IS NULL OR kind=?) AND (? IS NULL OR project_id=?) ORDER BY created_at,id',
+        'SELECT * FROM documents WHERE (? IS NULL OR kind=?) AND (? IS NULL OR project_id=?) AND (? IS NULL OR parent_id=?) ORDER BY created_at,id',
       )
-      .all(kind ?? null, kind ?? null, projectId ?? null, projectId ?? null)
+      .all(
+        kind ?? null,
+        kind ?? null,
+        projectId ?? null,
+        projectId ?? null,
+        parentId ?? null,
+        parentId ?? null,
+      )
       .map((r) => this.decode(r));
   }
   create(
@@ -162,25 +172,41 @@ export class Store {
     if (!row) throw new HttpError(404, '任务不存在');
     return this.decodeJob(row);
   }
-  jobs(projectId?: string): Job[] {
+  jobs(projectId?: string, episodeId?: string): Job[] {
     return this.db
-      .prepare('SELECT * FROM jobs WHERE (? IS NULL OR project_id=?) ORDER BY created_at')
-      .all(projectId ?? null, projectId ?? null)
+      .prepare(
+        'SELECT * FROM jobs WHERE (? IS NULL OR project_id=?) AND (? IS NULL OR episode_id=?) ORDER BY created_at',
+      )
+      .all(projectId ?? null, projectId ?? null, episodeId ?? null, episodeId ?? null)
       .map((r) => this.decodeJob(r));
   }
   createJob(
     kind: Job['kind'],
-    projectId: string,
+    projectId: string | null,
     episodeId: string | null,
     input: any,
     key: string,
   ): Job {
     return this.transaction(() => {
+      if (!projectId && !['voice_clone', 'speech'].includes(kind))
+        throw new HttpError(400, '此任务需要作品归属');
       const old = this.db.prepare('SELECT * FROM jobs WHERE idempotency_key=?').get(key);
       if (old) {
         const job = this.decodeJob(old);
-        const { creationCharge: _priorCharge, ...priorInput } = job.input;
-        const { creationCharge: _requestCharge, ...requestInput } = input;
+        const {
+          assistantCharge: _priorAssistantCharge,
+          creationCharge: _priorCharge,
+          modelCharge: _priorModelCharge,
+          speechCharge: _priorSpeechCharge,
+          ...priorInput
+        } = job.input;
+        const {
+          assistantCharge: _requestAssistantCharge,
+          creationCharge: _requestCharge,
+          modelCharge: _requestModelCharge,
+          speechCharge: _requestSpeechCharge,
+          ...requestInput
+        } = input;
         if (
           job.kind !== kind ||
           job.projectId !== projectId ||
@@ -197,7 +223,19 @@ export class Store {
         this.get(creationRunId).data.schemaVersion !== 9
       )
         throw new HttpError(409, '当前程序仅支持 V9 创作和生成作业');
-      if (kind === 'generation') {
+      if (['voice_clone', 'speech', 'lipsync', 'transcription'].includes(kind)) {
+        const { speechCharge: _untrusted, ...uncharged } = input;
+        input = {
+          ...uncharged,
+          speechCharge: reserveSpeechUsage(this, projectId, kind, uncharged),
+        };
+      } else if (
+        input.modelExecution &&
+        ['creative', 'image', 'generation', 'media_analysis'].includes(kind)
+      ) {
+        const { modelCharge: _untrusted, creationCharge: _oldCharge, ...uncharged } = input;
+        input = { ...uncharged, modelCharge: reserveModelUsage(this, projectId!, kind, uncharged) };
+      } else if (kind === 'generation') {
         const { creationCharge: _untrustedCharge, ...uncharged } = input;
         input = uncharged;
         // Jobs are the reservation ledger. Every dispatch path uses this same
@@ -241,6 +279,8 @@ export class Store {
           };
         }
       }
+      if (input.assistantRunId)
+        input = { ...input, assistantCharge: reserveAssistantUsage(this, projectId, kind, input) };
       const id = randomUUID(),
         now = Date.now();
       this.db
@@ -311,6 +351,13 @@ export class Store {
   }
   recover() {
     for (const job of this.jobs()) {
+      if (
+        ['media_process', 'previs'].includes(job.kind) &&
+        ['running', 'preparing'].includes(job.state)
+      ) {
+        this.patchJob(job.id, { state: 'queued', error: '本地处理将从已归档输出继续' });
+        continue;
+      }
       if (job.state === 'preparing')
         this.patchJob(job.id, { state: 'queued', error: 'Worker 中断，准备阶段将重试' });
       if (job.state === 'submitting')
@@ -318,7 +365,10 @@ export class Store {
           state: 'unknown',
           error: '提交期间中断；先核对云端任务，禁止自动重复提交',
         });
-      if (job.state === 'running' && job.kind !== 'generation')
+      if (
+        job.state === 'running' &&
+        !['generation', 'voice_clone', 'speech', 'lipsync'].includes(job.kind)
+      )
         this.patchJob(job.id, {
           state: 'failed',
           error: '本机执行中断，已保留输入和日志；可明确重试',

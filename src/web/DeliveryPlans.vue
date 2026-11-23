@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import VisualTransitions from './VisualTransitions.vue';
+import { timelineMap } from '../shared/edit-timeline';
 import { computed, onBeforeUnmount, ref, toRaw, watch } from 'vue';
 import type { WorkspaceSnapshot } from '../shared/workspace';
 import { parseSrt } from '../shared/creation-media';
@@ -26,13 +28,7 @@ const episode = computed(() =>
 );
 const canon = ref<any>(null);
 const output = computed(() => view.value?.assets.at(-1));
-const frames = computed(
-  () =>
-    draft.value?.edlDraft.clips.reduce(
-      (n: number, c: any) => n + Math.round((c.out - c.in) * 24),
-      0,
-    ) || 0,
-);
+const frames = computed(() => (draft.value ? timelineMap(draft.value.edlDraft).frames : 0));
 const dirty = computed(
   () =>
     !!view.value &&
@@ -186,17 +182,7 @@ async function exportPlan() {
   });
 }
 async function confirm() {
-  if (
-    busy.value ||
-    !view.value ||
-    view.value.validConfirmation ||
-    !output.value ||
-    !played.value ||
-    !watched.value ||
-    !listened.value ||
-    !conclusion.value.trim()
-  )
-    return;
+  if (busy.value || !view.value || view.value.validConfirmation || !output.value) return;
   await perform(async () => {
     if (dirty.value) throw new Error('请先保存修改并导出对应版本，再确认实际成片');
     const current = await api(`/creation-runs/${run.value!.id}`);
@@ -270,6 +256,7 @@ watch(
 );
 </script>
 <template>
+  <VisualTransitions v-if="draft" v-model="draft.edlDraft" />
   <section
     v-if="run && snapshot.results.director"
     class="delivery-plans"
@@ -300,8 +287,7 @@ watch(
         尚未采用：{{ draft.missingGroups.join('、') }}
       </p>
       <p>
-        实际采用 {{ frames }} 帧 /
-        {{ (frames / 24).toFixed(2) }} 秒。更改视频入出点请先重新审核采用。
+        实际采用 {{ frames }} 帧 / {{ (frames / 24).toFixed(2) }} 秒。更改入出点会更新实际使用范围。
       </p>
       <label
         >交付时长<select v-model="draft.duration.mode">
@@ -372,7 +358,11 @@ watch(
     </template>
     <template v-if="view">
       <AssemblyReview
-        v-if="episode?.data.seriesProduction && view.plan.data.target.mode === 'work' && output"
+        v-if="
+          output &&
+          (view?.edl.data.schemaVersion === 3 ||
+            (episode?.data.seriesProduction && view.plan.data.target.mode === 'work'))
+        "
         :key="`${view.plan.id}:${view.plan.revision}:${output.id}`"
         :edl-id="view.edl.id"
         :episode="episode"
@@ -411,17 +401,10 @@ watch(
               type="checkbox"
               :disabled="!played"
             />已核对对白、声音或明确的无声安排</label
-          ><textarea v-model="conclusion" placeholder="实际视听结论" /><button
-            :disabled="
-              busy ||
-              !played ||
-              !watched ||
-              !listened ||
-              !conclusion.trim() ||
-              view.blockers.length > 0
-            "
+          ><textarea v-model="conclusion" placeholder="可选观看备注；未检查不表示质量通过" /><button
+            :disabled="busy || view.blockers.length > 0"
           >
-            确认这一版交付
+            固定这一版作品
           </button>
         </form></template
       >

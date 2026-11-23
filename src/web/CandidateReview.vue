@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue';
+import { computed, ref, watch } from 'vue';
 import type { Job, RecordDoc } from '../shared/contracts';
 import { reviewDimensions } from '../shared/domain';
 import { api, assetUrl } from './api';
@@ -240,11 +240,27 @@ async function save() {
     notice.value = '候选审核已保存，尚未确认剧情状态。';
   });
 }
+async function makeAvailable() {
+  await act(async () => {
+    if (!video.value) return;
+    await api(`/assets/${video.value.id}/adopt`, 'POST', {
+      revision: video.value.revision,
+      adopted: true,
+    });
+    draft.value = null;
+    notice.value = '视频已加入可用素材；请重新审看此固定版本。素材可用不代表片段合格。';
+  });
+}
+watch(
+  () => video.value?.revision,
+  () => {
+    if (!draft.value && video.value) edit();
+  },
+);
 async function select() {
   await act(async () => {
-    if (!currentReview.value || !video.value || !episode.value) throw new Error('请先保存候选审核');
-    if (JSON.stringify(draft.value) !== JSON.stringify(currentReview.value.data))
-      throw new Error('候选审核有未保存修改，请先保存再采用');
+    if (!video.value || !episode.value) throw new Error('缺少实际视频或目标分集');
+    if (!draft.value) edit();
     await api(`/projects/${props.job.projectId}/selections`, 'POST', {
       revision: selection.value?.revision,
       data: {
@@ -252,7 +268,9 @@ async function select() {
         segmentId: props.job.input.segment.id,
         jobId: props.job.id,
         video: { id: video.value.id, revision: video.value.revision },
-        review: { id: currentReview.value.id, revision: currentReview.value.revision },
+        review: currentReview.value
+          ? { id: currentReview.value.id, revision: currentReview.value.revision }
+          : null,
         in: draft.value.in,
         out: draft.value.out,
         volume: 1,
@@ -264,7 +282,10 @@ async function select() {
 }
 </script>
 <template>
-  <details v-if="job.state === 'succeeded' && job.kind === 'generation' && video" class="panel">
+  <details
+    v-if="job.state === 'succeeded' && ['generation', 'lipsync'].includes(job.kind) && video"
+    class="panel"
+  >
     <summary
       @click="
         () => {
@@ -272,8 +293,12 @@ async function select() {
         }
       "
     >
-      候选审核与片段采用 {{ selection?.data.jobId === job.id ? '· 当前选择' : '' }}
+      片段选用与可选检查 {{ selection?.data.jobId === job.id ? '· 当前选择' : '' }}
     </summary>
+    <p v-if="!video.data.adopted">可以直接选择此候选；质量观察可另行记录。</p>
+    <button v-if="!video.data.adopted" :disabled="busy" @click="makeAvailable">
+      标记为常用素材
+    </button>
     <template v-if="draft"
       ><p class="error" role="alert" v-if="error">{{ error }}</p>
       <p v-if="notice">{{ notice }}</p>
@@ -422,7 +447,7 @@ async function select() {
           ><select v-model="i.severity">
             <option value="note">记录</option>
             <option value="warning">可接受问题</option>
-            <option value="blocking">阻断采用</option></select
+            <option value="blocking">重要问题</option></select
           ><textarea
             v-model="i.description"
             placeholder="实际观察到的问题，不直接写成剧情事实"
@@ -569,9 +594,7 @@ async function select() {
           />
         </template>
       </div>
-      <button class="primary" :disabled="busy || !currentReview" @click="select">
-        确认片段选择
-      </button></template
+      <button class="primary" :disabled="busy" @click="select">确认片段选择</button></template
     >
   </details>
 </template>

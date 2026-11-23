@@ -1,0 +1,544 @@
+.creative-workspace {
+  height: calc(100vh - 62px);
+  display: flex;
+  flex-direction: column;
+  min-height: 600px;
+  overflow: hidden;
+}
+.work-bar {
+  background: #fff;
+  border-bottom: 1px solid var(--studio-line);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 10px 20px;
+  min-height: 64px;
+}
+.work-identity {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+.work-identity strong {
+  max-width: 150px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 14px;
+}
+.work-identity select {
+  max-width: 190px;
+  font-size: 12px;
+}
+.work-identity > button {
+  padding: 6px 10px;
+}
+.work-bar .view-tabs {
+  overflow-x: auto;
+}
+.work-bar .view-tabs button {
+  font-size: 12px;
+  padding: 9px 10px;
+}
+.creative-grid {
+  display: grid;
+  grid-template-columns: 208px minmax(200px, 1fr) 318px;
+  min-height: 0;
+  flex: 1;
+}
+.resource-rail,
+.inspector-rail {
+  background: white;
+  overflow: auto;
+  min-width: 0;
+}
+.resource-rail {
+  padding: 22px 14px;
+  border-right: 1px solid var(--studio-line);
+}
+.inspector-rail {
+  border-left: 1px solid var(--studio-line);
+  padding: 16px 18px;
+}
+.inspector-rail > .view-tabs {
+  height: 38px;
+  flex: none;
+  margin-bottom: 20px;
+}
+.rail-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin: 12px 0;
+}
+.rail-actions .button {
+  border: 1px solid var(--studio-line);
+  padding: 7px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 12px;
+}
+.rail-actions button {
+  font-size: 12px;
+  padding: 7px 10px;
+}
+.rail-section {
+  border: 0;
+  width: 100%;
+  text-align: left;
+  color: var(--studio-accent);
+  background: var(--studio-tint);
+  margin: 12px 0;
+}
+.resource-item {
+  display: flex;
+  width: 100%;
+  gap: 10px;
+  align-items: center;
+  padding: 8px;
+  border: 1px solid transparent;
+  background: none;
+  text-align: left;
+  margin: 3px 0;
+}
+.resource-item:hover {
+  background: var(--studio-bg);
+  border-color: var(--studio-line);
+}
+.resource-item img,
+.resource-symbol {
+  width: 46px;
+  height: 46px;
+  object-fit: cover;
+  border-radius: 6px;
+  flex-shrink: 0;
+  background: #f0eef7;
+  display: grid;
+  place-items: center;
+}
+.resource-item strong {
+  font-size: 12px;
+  display: block;
+  word-break: break-word;
+}
+.resource-item small {
+  font-size: 10px;
+  display: block;
+  color: var(--studio-muted);
+  margin-top: 4px;
+}
+.flow-surface,
+.document-stage,
+.shot-grid-stage,
+.edit-main {
+  margin: 0;
+  max-width: none;
+  width: 100%;
+  min-width: 0;
+}
+.flow-surface {
+  padding: 0;
+  position: relative;
+  min-height: 420px;
+  background: radial-gradient(#d0d0e3 1px, transparent 1px) 0 0/22px 22px;
+}
+.canvas-toolbar {
+  position: absolute;
+  left: 20px;
+  top: 18px;
+  z-index: 5;
+  display: flex;
+  gap: 6px;
+  max-width: calc(100% - 40px);
+  flex-wrap: wrap;
+}
+.canvas-toolbar button {
+  background: white;
+  border-color: var(--studio-line);
+  box-shadow: 0 2px 6px #44445506;
+  font-size: 12px;
+  padding: 7px 10px;
+}
+.canvas-zoom {
+  position: absolute;
+  bottom: 20px;
+  left: 20px;
+  z-index: 5;
+  display: flex;
+  gap: 4px;
+}
+.canvas-zoom button {
+  background: white;
+}
+.canvas-welcome {
+  position: absolute;
+  inset: 80px 30px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  pointer-events: none;
+}
+.canvas-welcome > span {
+  font-size: 50px;
+  color: #b9b1e5;
+}
+.canvas-welcome h2 {
+  font-size: 23px;
+  font-weight: 600;
+}
+.canvas-welcome p {
+  max-width: 370px;
+  font-size: 13px;
+  line-height: 1.9;
+  color: var(--studio-muted);
+}
+.canvas-welcome button {
+  pointer-events: auto;
+  margin: 5px;
+}
+.creation-node {
+  width: 258px;
+  background: white;
+  border: 1px solid #dadfea;
+  border-radius: 12px;
+  box-shadow: 0 3px 9px #27284008;
+  overflow: hidden;
+}
+.vue-flow__node.selected .creation-node {
+  border-color: var(--studio-accent);
+  box-shadow: 0 0 0 1px var(--studio-accent);
+}
+.creation-node header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--studio-line);
+  font-size: 13px;
+}
+.creation-node header strong {
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.creation-node header small {
+  margin-left: auto;
+  color: var(--studio-muted);
+  font-size: 10px;
+}
+.creation-node .node-body {
+  padding: 14px;
+  min-height: 90px;
+  font-size: 12px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  max-height: 170px;
+  overflow: hidden;
+}
+.creation-node footer {
+  display: flex;
+  justify-content: space-between;
+  padding: 9px 14px;
+  font-size: 10px;
+  color: var(--studio-muted);
+  border-top: 1px solid var(--studio-line);
+}
+.creation-node.chosen footer {
+  color: var(--studio-accent);
+  background: var(--studio-tint);
+}
+.node-visual img,
+.node-visual video {
+  display: block;
+  width: 100%;
+  max-height: 200px;
+  object-fit: contain;
+  background: #f5f4fa;
+}
+.node-visual audio {
+  width: 100%;
+  height: 70px;
+}
+.vue-flow__handle {
+  width: 9px;
+  height: 9px;
+  background: #fff;
+  border: 1px solid #8c82df;
+}
+.vue-flow__edge-text {
+  font-size: 10px;
+  color: #787495;
+}
+.vue-flow__edge-textbg {
+  fill: #fff;
+}
+.node-inspector > label,
+.agent-panel label {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  margin: 0 0 18px;
+  font-size: 12px;
+  color: #485270;
+}
+.node-inspector label input,
+.node-inspector select,
+.node-inspector textarea,
+.agent-panel input,
+.agent-panel textarea {
+  width: 100%;
+  min-width: 0;
+}
+.node-inspector .field-title input {
+  font-size: 18px;
+  font-weight: 650;
+  border-color: transparent;
+  padding-left: 0;
+}
+.node-inspector textarea {
+  font-size: 12px;
+  line-height: 1.8;
+  resize: vertical;
+}
+.node-inspector details,
+.agent-panel details {
+  margin: 15px 0;
+}
+.node-inspector summary,
+.agent-panel summary {
+  font-size: 12px;
+  color: #60698b;
+  cursor: pointer;
+  padding: 10px 0;
+}
+.node-inspector details label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12px;
+  margin: 8px 0;
+}
+.inspector-preview img,
+.inspector-preview video {
+  width: 100%;
+  max-height: 220px;
+  object-fit: contain;
+  border-radius: 7px;
+  background: var(--studio-bg);
+}
+.inspector-preview audio {
+  width: 100%;
+}
+.inspector-preview small {
+  display: block;
+  color: var(--studio-muted);
+  font-size: 10px;
+  margin: 9px 0 18px;
+}
+.inspector-actions {
+  display: grid;
+  gap: 8px;
+  margin: 20px 0;
+}
+.quiet-danger {
+  border: 0;
+  background: transparent;
+  color: #9a7183;
+  font-size: 11px;
+  margin-top: 18px;
+}
+.execution-preview {
+  background: var(--studio-bg);
+  border: 1px solid var(--studio-line);
+  padding: 13px;
+  border-radius: 8px;
+  font-size: 11px;
+}
+.execution-preview small {
+  display: block;
+  overflow-wrap: anywhere;
+  margin: 8px 0;
+}
+.execution-preview pre {
+  max-height: 300px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 10px;
+}
+.reference-item {
+  padding: 10px 0;
+  border-bottom: 1px solid var(--studio-line);
+  font-size: 11px;
+}
+.reference-item textarea {
+  width: 100%;
+  margin-top: 8px;
+}
+.reference-item button {
+  font-size: 10px;
+  padding: 4px 7px;
+}
+.agent-panel h2 {
+  font-size: 19px;
+}
+.agent-panel form > button {
+  width: 100%;
+  margin: 15px 0;
+}
+.agent-panel form > small {
+  display: block;
+  color: var(--studio-muted);
+  font-size: 11px;
+  line-height: 1.7;
+}
+.agent-status {
+  padding: 12px;
+  background: var(--studio-tint);
+  border-radius: 8px;
+  display: flex;
+  justify-content: space-between;
+  font-size: 12px;
+}
+.agent-receipts {
+  padding-left: 19px;
+  border-left: 1px solid var(--studio-line);
+  list-style: none;
+}
+.agent-receipts li {
+  margin: 20px 0;
+  font-size: 12px;
+}
+.agent-receipts p {
+  color: #67718f;
+  word-break: break-word;
+}
+.agent-receipts small {
+  color: var(--studio-muted);
+  font-size: 10px;
+}
+.task-dock {
+  position: relative;
+  height: 38px;
+  min-height: 38px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 20px;
+  background: white;
+  border-top: 1px solid var(--studio-line);
+  font-size: 11px;
+  color: var(--studio-muted);
+}
+.task-dock > button {
+  border: 0;
+  background: none;
+  font-size: 11px;
+}
+.dock-jobs {
+  position: absolute;
+  bottom: 38px;
+  left: 0;
+  right: 0;
+  background: #fff;
+  border-top: 1px solid var(--studio-line);
+  box-shadow: 0 -6px 20px #3434500a;
+  max-height: 250px;
+  overflow: auto;
+  padding: 18px;
+  z-index: 10;
+}
+.dock-jobs > div {
+  display: flex;
+  gap: 20px;
+  padding: 9px;
+  border-bottom: 1px solid var(--studio-line);
+  align-items: center;
+}
+.dock-jobs small {
+  flex: 1;
+  color: #a36161;
+}
+.dock-jobs button {
+  font-size: 11px;
+}
+.document-stage,
+.shot-grid-stage {
+  overflow: auto;
+  padding: 28px;
+  min-width: 0;
+}
+.document-stage > header,
+.shot-grid-stage > header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 20px;
+}
+.document-paper {
+  max-width: 850px;
+  background: white;
+  border: 1px solid var(--studio-line);
+  padding: 28px;
+  border-radius: 10px;
+  margin: 0 auto 20px;
+}
+.document-paper input {
+  font-size: 22px;
+  font-weight: 650;
+  border: 0;
+  margin-bottom: 20px;
+}
+.document-paper textarea {
+  width: 100%;
+  min-height: 400px;
+  border: 0;
+  resize: vertical;
+  font-size: 14px;
+  line-height: 2;
+}
+.document-paper small {
+  color: var(--studio-muted);
+}
+.shot-card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 20px;
+}
+.shot-card-grid > button {
+  overflow: hidden;
+  text-align: left;
+  padding: 0 0 14px;
+  background: white;
+  border: 1px solid var(--studio-line);
+}
+.shot-card-grid img,
+.shot-card-grid video,
+.shot-placeholder {
+  height: 140px;
+  width: 100%;
+  object-fit: cover;
+  background: #eeedf6;
+}
+.shot-placeholder {
+  display: grid;
+  place-items: center;
+  font-size: 35px;
+  color: #a39bbf;
+}
+.shot-card-grid strong,
+.shot-card-grid p,
+.shot-card-grid small {
+  display: block;
+  margin: 12px 14px;
+}
+.shot-card-grid p,
+.shot-card-grid small {
+  font-size: 11px;
+  color: var(--studio-muted);
+}

@@ -4,14 +4,20 @@ import { api, downloadJson } from './api';
 import RecordPicker from './RecordPicker.vue';
 import ContractField from './ContractField.vue';
 import VoiceLibrary from './VoiceLibrary.vue';
+import SeasonStory from './SeasonStory.vue';
+import SeasonFacts from './SeasonFacts.vue';
+import SeasonProposal from './SeasonProposal.vue';
+import ValidationExperiment from './ValidationExperiment.vue';
 import { useDraft } from './drafts';
 const props = defineProps<{ projectId: string; documents: any[] }>(),
   emit = defineEmits(['refresh']);
 const seriesId = ref(''),
+  slotPage = ref(0),
   draft = ref<any>(null),
   base = ref(0),
   preview = ref<any>(null),
   progress = ref<any>(null),
+  saving = ref(false),
   error = ref(''),
   newTitle = ref('');
 const series = computed(() => props.documents.filter((d) => d.kind === 'series'));
@@ -25,10 +31,26 @@ const profiles = computed(() =>
 const facts = computed(() =>
   props.documents.filter((d) => d.kind === 'continuity' && d.data.seriesId === seriesId.value),
 );
+let loadedOwner = '',
+  loadedProduction = '';
 watch(
-  [() => props.projectId, seriesId, () => selected.value?.id],
+  [() => props.projectId, seriesId, () => selected.value?.id, () => selected.value?.revision],
   () => {
+    const owner = `${props.projectId}:${seriesId.value}`;
+    if (
+      owner === loadedOwner &&
+      base.value &&
+      selected.value?.revision !== base.value &&
+      JSON.stringify(draft.value) !== loadedProduction
+    ) {
+      preview.value = null;
+      error.value = '系列已有新版本；当前未提交编辑已保留，请导出比较或明确载入服务器版本。';
+      void loadProgress();
+      return;
+    }
+    loadedOwner = owner;
     base.value = selected.value?.revision || 0;
+    slotPage.value = 0;
     draft.value = JSON.parse(
       JSON.stringify(
         selected.value?.data.production || {
@@ -47,6 +69,7 @@ watch(
         },
       ),
     );
+    loadedProduction = JSON.stringify(draft.value);
     preview.value = progress.value = null;
     if (selected.value?.data.production) void loadProgress();
   },
@@ -68,6 +91,14 @@ async function loadProgress() {
     error.value = e.message;
   }
 }
+async function reloadCurrent() {
+  await local.discard();
+  base.value = selected.value?.revision || 0;
+  draft.value = JSON.parse(JSON.stringify(selected.value?.data.production));
+  loadedProduction = JSON.stringify(draft.value);
+  preview.value = null;
+  error.value = '';
+}
 async function create() {
   try {
     const d = await api(`/projects/${props.projectId}/series`, 'POST', { title: newTitle.value });
@@ -83,6 +114,7 @@ async function prepare() {
   try {
     if (base.value !== selected.value?.revision)
       throw new Error('系列已有新版本，请导出草稿比较后重新打开');
+    if (local.conflict.value) throw new Error('请先处理旧版本本机草稿，再预览当前计划');
     const result = await api(`/series/${id}/plan/preview`, 'POST', {
       data: draft.value,
     });
@@ -94,7 +126,10 @@ async function prepare() {
   }
 }
 async function apply() {
-  const id = seriesId.value;
+  if (saving.value || !preview.value) return;
+  const id = seriesId.value,
+    submitted = JSON.stringify(draft.value);
+  saving.value = true;
   try {
     const d = await api(`/series/${seriesId.value}/plan/apply`, 'POST', {
       ...preview.value,
@@ -103,20 +138,31 @@ async function apply() {
     });
     emit('refresh');
     if (id !== seriesId.value) return;
+    if (submitted !== JSON.stringify(draft.value)) {
+      preview.value = null;
+      error.value =
+        '已应用预览版本；等待期间的新编辑仍保留。请导出草稿，重新打开系列后比较再提交。';
+      return;
+    }
     await local.discard();
     if (id !== seriesId.value) return;
     base.value = d.revision;
     draft.value = d.data.production;
+    loadedProduction = JSON.stringify(draft.value);
     emit('refresh');
     await loadProgress();
     error.value = '';
   } catch (e: any) {
     error.value = e.message;
+  } finally {
+    saving.value = false;
   }
 }
 async function createEpisode(slot: any) {
   const id = seriesId.value;
   try {
+    if (JSON.stringify(draft.value) !== JSON.stringify(selected.value?.data.production))
+      throw new Error('当前规划有未提交编辑，请先预览并应用计划，再建立本集草稿。');
     await api(`/projects/${props.projectId}/episodes`, 'POST', {
       seriesId: seriesId.value,
       slotId: slot.id,
@@ -128,6 +174,7 @@ async function createEpisode(slot: any) {
     if (id !== seriesId.value) return;
     base.value = current.revision;
     draft.value = current.data.production;
+    loadedProduction = JSON.stringify(draft.value);
     await loadProgress();
   } catch (e: any) {
     error.value = e.message;
@@ -149,8 +196,31 @@ async function createEpisode(slot: any) {
     </div>
     <p class="error" v-if="error">{{ error }}</p>
     <p>{{ local.message.value }}</p>
+    <details v-if="local.conflict.value" open>
+      <summary>旧版本规划草稿</summary>
+      <p>当前打开的是系列固定版本，旧草稿仍保留。先导出比较，再明确清除冲突。</p>
+      <button @click="downloadJson('旧版本系列草稿.json', local.conflict.value.data)">
+        导出旧草稿</button
+      ><button @click="local.discard().catch((e: any) => (error = e.message))">
+        放弃旧草稿，使用当前版本
+      </button>
+    </details>
+    <div v-if="selected && base !== selected.revision" class="notice">
+      当前编辑基于 v{{ base }}，服务器为 v{{ selected.revision }}。
+      <button @click="downloadJson('未提交系列规划.json', draft)">导出当前编辑</button>
+      <button @click="reloadCurrent().catch((e: any) => (error = e.message))">
+        放弃当前编辑并载入服务器版本
+      </button>
+    </div>
     <template v-if="selected && draft" :key="seriesId"
-      ><div class="form-grid">
+      ><SeasonProposal
+        :series-id="seriesId"
+        :project-id="projectId"
+        :series-revision="selected.revision"
+        :plan="draft"
+        @refresh="emit('refresh')"
+      />
+      <div class="form-grid">
         <label
           >固定创作配置<select
             :value="draft.profile?.id || ''"
@@ -191,6 +261,47 @@ async function createEpisode(slot: any) {
             min="0"
         /></label>
       </div>
+      <button
+        @click="
+          draft.targetEpisodes = 10;
+          draft.runtime = { targetFrames: 7200, toleranceFrames: 0 };
+        "
+      >
+        预填 5 分钟 × 10 集
+      </button>
+      <details>
+        <summary>系列画幅与跨集状态</summary>
+        <button
+          v-if="!draft.canvas"
+          @click="draft.canvas = { width: 1024, height: 576, mismatch: 'require_match' }"
+        >
+          固定系列交付画布
+        </button>
+        <div v-if="draft.canvas" class="form-grid">
+          <label>宽<input v-model.number="draft.canvas.width" type="number" step="2" /></label
+          ><label>高<input v-model.number="draft.canvas.height" type="number" step="2" /></label
+          ><label
+            >不同生成画幅<select v-model="draft.canvas.mismatch">
+              <option value="require_match">重新准备一致构图</option>
+              <option value="letterbox">明确等比留边</option>
+            </select></label
+          ><button @click="delete draft.canvas">继承项目画布</button>
+        </div>
+        <button
+          v-if="!draft.factDependency"
+          @click="draft.factDependency = { mode: 'previous', reason: '本系列为连续剧情' }"
+        >
+          明确跨集事实依赖
+        </button>
+        <div v-if="draft.factDependency">
+          <label
+            >单元关系<select v-model="draft.factDependency.mode">
+              <option value="previous">连载，读取直接前集事实</option>
+              <option value="independent">独立单元，只共享身份设计</option>
+            </select></label
+          ><label>关系依据<input v-model="draft.factDependency.reason" /></label>
+        </div>
+      </details>
       <label
         >时间线关系<select
           v-model="draft.chronology.mode"
@@ -218,7 +329,7 @@ async function createEpisode(slot: any) {
           </tr>
         </thead>
         <tbody>
-          <tr v-for="slot in draft.slots" :key="slot.id">
+          <tr v-for="slot in draft.slots.slice(slotPage * 10, slotPage * 10 + 10)" :key="slot.id">
             <td>
               <input v-model="slot.title" /><small>{{ slot.id }}</small
               ><label><input type="checkbox" v-model="slot.active" />计入当前计划</label>
@@ -275,17 +386,18 @@ async function createEpisode(slot: any) {
           </tr>
         </tbody>
       </table>
+      <button :disabled="slotPage === 0" @click="slotPage--">上一页分集</button
+      ><span>共 {{ draft.slots.length }} 个规划条目</span
+      ><button :disabled="(slotPage + 1) * 10 >= draft.slots.length" @click="slotPage++">
+        下一页分集
+      </button>
       <ContractField label="动作定义与有限阶段" v-model="draft.actionDefinitions" />
       <ContractField label="共享资料固定版本" v-model="draft.sharedReferences" /><ContractField
         label="系列声音绑定（实例与 profile 版本）"
         v-model="draft.voices"
-      /><ContractField
-        label="铺垫、误导、揭示与回收条目"
-        v-model="draft.information"
-      /><ContractField label="人物变化节点" v-model="draft.characterBeats" /><ContractField
-        label="明确的画外剧情事实"
-        v-model="draft.authoredEvents"
       />
+      <SeasonStory :plan="draft" :progress="progress" />
+      <ValidationExperiment :series-id="seriesId" :project-id="projectId" />
       <button @click="prepare">预览集数与时长影响</button
       ><button @click="downloadJson('系列制作草稿.json', draft)">导出草稿</button>
 
@@ -308,7 +420,9 @@ async function createEpisode(slot: any) {
             <td>{{ i.delivered ? '已有历史交付' : '' }}</td>
           </tr>
         </table>
-        <button @click="apply">确认应用当前计划</button>
+        <button :disabled="saving" @click="apply">
+          {{ saving ? '正在应用计划' : '确认应用当前计划' }}
+        </button>
       </div>
       <p v-if="progress">
         正式交付 {{ progress.delivered }} / {{ progress.targetEpisodes }} 集；{{
@@ -353,28 +467,7 @@ async function createEpisode(slot: any) {
           </td>
         </tr>
       </table>
-      <h3>本系列事实与角色认知</h3>
-      <p>计划的回收与实际成片证据分开保存。前集待复核会阻止正式接续。</p>
-      <article class="panel" v-for="c in facts">
-        <strong
-          >第 {{ c.data.episodeNumber }} 集 Canon v{{ c.revision }} ·
-          {{
-            c.data.stale || progress?.facts?.find((f: any) => f.id === c.id)?.problems.length
-              ? '待复核'
-              : c.data.confirmed
-                ? '已确认'
-                : '未确认'
-          }}</strong
-        >
-        <table>
-          <tr v-for="f in c.data.facts">
-            <td>{{ f.kind }}</td>
-            <td>{{ f.text }}</td>
-            <td>{{ f.source?.kind || '来源待核实' }}</td>
-            <td>{{ f.effective?.slotId }}</td>
-          </tr>
-        </table>
-      </article>
+      <SeasonFacts :facts="facts" :progress="progress" :series-id="seriesId" />
     </template>
   </section>
   <VoiceLibrary :project-id="projectId" :documents="documents" @refresh="emit('refresh')" />

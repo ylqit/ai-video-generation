@@ -4,6 +4,7 @@ import { api, assetUrl } from './api';
 import { assemblyDimensions } from '../shared/series';
 import RecordPicker from './RecordPicker.vue';
 import ContractField from './ContractField.vue';
+import JoinInspection from './JoinInspection.vue';
 const props = defineProps<{
     edlId: string;
     episode: any;
@@ -47,8 +48,13 @@ async function load() {
   try {
     if (props.fixedExport) exportAsset.value = props.fixedExport;
     snapshot.value = await api(`/edls/${props.edlId}/assembly`);
-    const chain = await api(`/episodes/${props.episode.id}/series-facts`);
-    if (!canon.value || canon.value.episode.id !== props.episode.id)
+    const chain = props.episode.data.seriesProduction
+      ? await api(`/episodes/${props.episode.id}/series-facts`)
+      : { canon: null };
+    if (
+      props.episode.data.seriesProduction &&
+      (!canon.value || canon.value.episode.id !== props.episode.id)
+    )
       canon.value = {
         schemaVersion: 3,
         episode: snapshot.value.episode,
@@ -82,6 +88,7 @@ function choose(s: any) {
     endFrame: w.endFrame,
     dimensions: Object.fromEntries(assemblyDimensions.map((d) => [d, 'unreviewed'])),
     reasons: {},
+    presentedEvidence: [],
     watched: false,
     listened: false,
     conclusion: '',
@@ -184,6 +191,7 @@ async function confirm() {
       </table></template
     >
     <div v-if="review" class="panel">
+      <JoinInspection v-if="scope?.scope === 'join'" :scope="scope" />
       <h4>{{ review.scope }} · {{ review.key }}</h4>
       <button @click="emit('play', { startFrame: review.startFrame, endFrame: review.endFrame })">
         播放已保存时间线的审核区间
@@ -206,6 +214,20 @@ async function confirm() {
           <td><input v-model="review.reasons[d]" placeholder="问题证据或不适用理由" /></td>
         </tr>
       </table>
+      <fieldset v-if="scope?.content.recheckEvidence?.length">
+        <legend>转场或音轨影响的原观察 · 按实际导出重新确认</legend>
+        <label v-for="e in scope.content.recheckEvidence" :key="e.selection.id + e.evidenceId"
+          ><input
+            type="checkbox"
+            v-model="review.presentedEvidence"
+            :value="{ selection: e.selection, evidenceId: e.evidenceId }"
+            :disabled="!e.contained"
+          />{{ e.evidenceId }} · 成片 [{{ e.startFrame + scope.startFrame }},
+          {{ e.endFrame + scope.startFrame }}){{
+            e.contained ? ' 仍可确认呈现' : ' 已被裁掉，不能用于事实'
+          }}</label
+        >
+      </fieldset>
       <label><input type="checkbox" v-model="review.watched" />实际看过相关区间</label
       ><label><input type="checkbox" v-model="review.listened" />实际听过生效声音</label
       ><label>审核结论<textarea v-model="review.conclusion" /></label
@@ -230,6 +252,7 @@ async function confirm() {
     />
     <p>整集审核必须完整观看上述固定导出。选择素材不会自动标记看审或听审。</p>
     <ContractField v-if="canon" label="本集 Canon 变化及证据（V3）" v-model="canon" /><button
+      v-if="canon"
       @click="prepare"
     >
       预览交付与事实确认

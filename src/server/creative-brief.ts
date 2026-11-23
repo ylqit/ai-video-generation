@@ -84,7 +84,7 @@ export function resolveCreativeBrief(
     if (!doc.data.published)
       checks.push({
         code: 'module-unpublished',
-        severity: 'blocking',
+        severity: 'warning',
         message: `模块尚未审核发布：${doc.data.name}`,
       });
     return {
@@ -196,22 +196,21 @@ export function resolveCreativeBrief(
       if (!composition.visualReference.reviewed)
         checks.push({
           code: 'visual-reference-unreviewed',
-          severity: 'blocking',
-          message: '视觉参考规范尚未审核',
+          severity: 'warning',
+          message: '视觉参考尚未观察',
         });
       const asset = domain.owned(projectId, composition.visualReference.asset, 'asset');
-      if (!asset.data.adopted || asset.data.mediaType !== 'image')
-        throw new HttpError(400, '视觉参考需要已采用图片');
+      if (asset.data.mediaType !== 'image') throw new HttpError(400, '视觉参考需要固定图片');
     }
   }
   if (!profile.data.published)
     checks.push({
       code: 'profile-unpublished',
-      severity: 'blocking',
+      severity: 'warning',
       message: '制作规范尚未审核发布',
     });
-  if (requirePublished && checks.some((c) => c.severity === 'blocking'))
-    throw new HttpError(409, checks.map((c) => c.message).join('；'));
+  // Missing artistic decisions remain visible suggestions, not quality gates.
+  for (const check of checks) if (check.severity === 'blocking') check.severity = 'warning';
   const content = {
     schemaVersion: seriesMode ? 3 : universal ? 2 : 1,
     profile: { id: profile.id, revision: profile.revision },
@@ -272,7 +271,7 @@ export function selectedProfile(
     !['director-v5', 'director-v6', 'director-v7'].includes(profile.data.rulesVersion) ||
     (rulesVersion && profile.data.rulesVersion !== rulesVersion)
   )
-    throw new HttpError(400, '请创建并审核制作配置');
+    throw new HttpError(400, '请创建制作配置');
   return profile;
 }
 

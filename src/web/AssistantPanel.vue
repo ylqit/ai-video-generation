@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue';
+import { computed, ref, watch } from 'vue';
 import type { WorkspaceSnapshot } from '../shared/workspace';
 import { creationStageLabels } from '../shared/creation';
 import { api } from './api';
+import AdaptationIntent from './AdaptationIntent.vue';
 const props = defineProps<{ snapshot: WorkspaceSnapshot; references: any[]; episodeId?: string }>();
 const emit = defineEmits([
   'removeRef',
@@ -13,6 +14,32 @@ const emit = defineEmits([
   'approve',
   'sourceImported',
 ]);
+const adaptation = ref<any>({
+  version: 1,
+  mode: 'original',
+  preserve: [],
+  allow: [],
+  pending: [],
+  decisions: [],
+});
+watch(
+  () => `${props.snapshot.project.id}:${props.episodeId || ''}:${props.snapshot.run?.id || ''}`,
+  () => {
+    adaptation.value = JSON.parse(
+      JSON.stringify(
+        props.snapshot.run?.data.adaptation || {
+          version: 1,
+          mode: 'original',
+          preserve: [],
+          allow: [],
+          pending: [],
+          decisions: [],
+        },
+      ),
+    );
+  },
+  { immediate: true },
+);
 const request = ref(''),
   mode = ref<'discuss' | 'revise' | 'execute'>('discuss'),
   stage = ref('script'),
@@ -36,12 +63,16 @@ async function send() {
   error.value = '';
   const owner = `${props.snapshot.project.id}:${props.episodeId || ''}:${props.snapshot.run?.id || ''}`;
   const submitted = request.value;
+  const originalRequest = request.value;
   try {
+    if (props.snapshot.context?.selectionRequired)
+      throw new Error('请先明确选择目标系列、分集与创作版本，再提交该作品的指令');
     if (!props.snapshot.run) {
       const run = await api(`/projects/${props.snapshot.project.id}/creation-runs`, 'POST', {
         request: submitted,
         ...(props.episodeId ? { episodeId: props.episodeId } : {}),
         sources: props.references.map(({ id, revision }) => ({ id, revision })),
+        adaptation: adaptation.value,
         idempotencyKey: crypto.randomUUID(),
       });
       if (
@@ -51,7 +82,7 @@ async function send() {
         return;
       emit('created', run.id);
     } else {
-      const scoped = props.references.filter((r) => r.shotId || r.sceneId);
+      const scoped = props.references.filter((r) => r.shotId || r.sceneId || r.subjectKey);
       const baseline = scoped[0];
       if (
         mode.value === 'revise' &&
@@ -73,12 +104,16 @@ async function send() {
         ...(mode.value === 'revise'
           ? {
               stage: baseline?.shotId ? 'director' : baseline?.sceneId ? 'script' : stage.value,
+              adaptation: adaptation.value,
               ...(baseline
                 ? {
                     writable: {
                       baseline: { id: baseline.id, revision: baseline.revision },
                       shotIds: [...new Set(scoped.flatMap((r) => (r.shotId ? [r.shotId] : [])))],
                       sceneIds: [...new Set(scoped.flatMap((r) => (r.sceneId ? [r.sceneId] : [])))],
+                      subjectKeys: [
+                        ...new Set(scoped.flatMap((r) => (r.subjectKey ? [r.subjectKey] : []))),
+                      ],
                     },
                   }
                 : {}),
@@ -93,7 +128,7 @@ async function send() {
         return;
       if (result.run?.id) emit('created', result.run.id);
     }
-    if (request.value === submitted) request.value = '';
+    if (request.value === originalRequest) request.value = '';
     emit('refresh');
   } catch (e: any) {
     error.value = e.message;
@@ -133,6 +168,7 @@ async function fileSource(event: Event) {
     </header>
     <div class="conversation" aria-live="polite" aria-label="创作会话">
       <div class="assistant-intro">
+        <AdaptationIntent v-model="adaptation" />
         <span class="mini-label">WORKSPACE ASSISTANT</span>
         <h2>{{ snapshot.run ? '继续这部作品' : '想创作怎样的故事？' }}</h2>
         <p>

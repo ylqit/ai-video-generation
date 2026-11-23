@@ -1,0 +1,194 @@
+.edit-workspace {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 220px minmax(0, 1fr);
+  overflow: hidden;
+}
+.edit-bin {
+  background: white;
+  border-right: 1px solid var(--studio-line);
+  padding: 24px 16px;
+  overflow: auto;
+}
+.edit-bin-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  width: 100%;
+  text-align: left;
+  background: none;
+  margin: 10px 0;
+  border-color: var(--studio-line);
+}
+.edit-bin-item img {
+  width: 60px;
+  height: 45px;
+  object-fit: cover;
+}
+.edit-bin-item strong {
+  font-size: 12px;
+  max-width: 120px;
+}
+.edit-bin-item small {
+  font-size: 10px;
+  color: var(--studio-muted);
+}
+.edit-main {
+  overflow: auto;
+  padding: 26px 32px 60px;
+}
+.edit-main > header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.edit-player {
+  background: #181b2a;
+  margin: 22px auto 0;
+  border-radius: 12px;
+  min-height: 200px;
+  max-width: 1000px;
+  overflow: hidden;
+  position: relative;
+}
+.edit-player > div {
+  max-height: clamp(220px, 38dvh, 400px);
+}
+.playback-controls {
+  display: flex;
+  gap: 15px;
+  align-items: center;
+  padding: 14px 0;
+  max-width: 1000px;
+  margin: auto;
+}
+.playback-controls input {
+  flex: 1;
+}
+.playback-controls span {
+  font-size: 12px;
+  white-space: nowrap;
+}
+.timeline-strip {
+  display: flex;
+  gap: 4px;
+  overflow: auto;
+  border: 1px solid var(--studio-line);
+  border-radius: 8px;
+  padding: 16px;
+  background: white;
+}
+.timeline-strip button {
+  background: var(--studio-tint);
+  border-color: #ded7f6;
+  min-width: 150px;
+  text-align: left;
+  display: grid;
+  gap: 15px;
+}
+.timeline-strip span {
+  font-size: 12px;
+}
+.timeline-strip small {
+  font-size: 10px;
+  color: var(--studio-muted);
+}
+.clip-properties {
+  background: white;
+  padding: 18px;
+  border: 1px solid var(--studio-line);
+  border-radius: 8px;
+  margin: 16px 0;
+}
+.clip-row {
+  display: flex;
+  align-items: end;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--studio-line);
+}
+.clip-row label {
+  display: grid;
+  gap: 5px;
+  font-size: 11px;
+}
+.clip-row label input {
+  max-width: 100px;
+  min-width: 0;
+}
+.clip-row button {
+  font-size: 11px;
+}
+.clip-row > input {
+  max-width: 320px;
+}
+.edit-main details.panel {
+  background: white;
+}
+.export-results {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+  gap: 16px;
+}
+.export-results h3 {
+  grid-column: 1/-1;
+}
+.export-results article {
+  background: white;
+  padding: 15px;
+  display: grid;
+  gap: 12px;
+  border: 1px solid var(--studio-line);
+  border-radius: 10px;
+}
+.export-results video {
+  width: 100%;
+}
+.export-results small {
+  color: var(--studio-muted);
+  font-size: 11px;
+}
+.settings-grid {
+  display: grid;
+  grid-template-columns: 210px minmax(0, 1fr);
+  gap: 28px;
+  align-items: start;
+}
+.settings-grid > nav {
+  display: grid;
+  gap: 7px;
+  position: sticky;
+  top: 20px;
+}
+.settings-grid > nav button,
+.settings-grid > nav a {
+  text-align: left;
+  padding: 13px 16px;
+  border: 0;
+  background: none;
+  text-decoration: none;
+  color: #67718d;
+  font-size: 13px;
+}
+.settings-grid > nav .active {
+  background: var(--studio-tint);
+  color: var(--studio-accent);
+  border-radius: 8px;
+}
+.settings-grid > main {
+  min-width: 0;
+}
+.settings-grid > main > .panel {
+  margin-top: 0;
+}
+.work-settings {
+  padding: 30px 40px;
+  overflow: auto;
+  flex: 1;
+}
+.asset-library-shell > .view-tabs {
+  margin-bottom: 26px;
+}

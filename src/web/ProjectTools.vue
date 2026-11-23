@@ -7,6 +7,7 @@ import CreationProfile from './CreationProfile.vue';
 import SubjectStudio from './SubjectStudio.vue';
 import LayoutStudio from './LayoutStudio.vue';
 import Timeline from './Timeline.vue';
+import VoiceLibrary from './VoiceLibrary.vue';
 
 const props = defineProps<{
   project: RecordDoc;
@@ -26,15 +27,17 @@ async function load() {
   loading.value = true;
   try {
     const kinds =
-      tab.value === 'formal'
-        ? ['asset', 'edl']
-        : tab.value === 'series'
-          ? ['series', 'creation_profile', 'continuity', 'entity', 'voice_profile', 'episode']
-          : tab.value === 'profile'
-            ? ['creation_profile', 'creative_module', 'entity']
-            : tab.value === 'subjects'
-              ? ['entity', 'appearance', 'reference_pack', 'asset_task']
-              : ['layout', 'entity'];
+      tab.value === 'voices'
+        ? ['entity', 'voice_profile', 'dialogue_take']
+        : tab.value === 'formal'
+          ? ['asset', 'edl']
+          : tab.value === 'series'
+            ? ['series', 'creation_profile', 'continuity', 'entity', 'voice_profile', 'episode']
+            : tab.value === 'profile'
+              ? ['creation_profile', 'creative_module', 'entity']
+              : tab.value === 'subjects'
+                ? ['entity', 'appearance', 'reference_pack', 'asset_task']
+                : ['layout', 'entity'];
     const groups = await Promise.all(
       kinds.map(async (kind) => {
         const items: RecordDoc[] = [];
@@ -53,6 +56,7 @@ async function load() {
     const current = props.episodeId ? await api(`/records/${props.episodeId}`) : null;
     if (seq !== ticket) return;
     records.value = groups.flat();
+    if (tab.value === 'voices' && current) records.value.push(current);
     episode.value = current;
     error.value = '';
   } catch (e: any) {
@@ -85,12 +89,19 @@ async function refresh() {
         主体与参考包
       </button>
       <button :class="{ active: tab === 'space' }" @click="tab = 'space'">空间编辑</button>
+      <button :class="{ active: tab === 'voices' }" @click="tab = 'voices'">人物与声音</button>
       <button v-if="episodeId" :class="{ active: tab === 'formal' }" @click="tab = 'formal'">
         正式装配
       </button>
     </nav>
     <p v-if="error" role="alert" class="error">{{ error }}</p>
     <p v-if="loading && !records.length">正在读取相关内容…</p>
+    <VoiceLibrary
+      v-if="tab === 'voices'"
+      :project-id="project.id"
+      :documents="records"
+      @refresh="refresh"
+    />
     <SeriesProduction
       v-if="tab === 'series'"
       :project-id="project.id"

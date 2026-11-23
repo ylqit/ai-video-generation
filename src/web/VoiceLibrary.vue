@@ -2,6 +2,7 @@
 import { ref } from 'vue';
 import RecordPicker from './RecordPicker.vue';
 import ContractField from './ContractField.vue';
+import ProjectVoices from './ProjectVoices.vue';
 import { api, assetUrl } from './api';
 const structuredClone = globalThis.structuredClone;
 let editorVersion = 0;
@@ -19,6 +20,32 @@ const error = ref(''),
     performance: '',
     samples: [],
   });
+const conversion = ref<any>(null),
+  converted = ref('');
+async function previewConversion() {
+  try {
+    conversion.value = await api(
+      '/voice-profiles/' + current.value.id + '/conversion-preview',
+      'POST',
+      { revision: current.value.revision },
+    );
+    error.value = '';
+  } catch (e: any) {
+    error.value = e.message;
+  }
+}
+async function convert() {
+  try {
+    const v = await api('/voice-profiles/' + conversion.value.source.id + '/convert', 'POST', {
+      revision: conversion.value.source.revision,
+      confirmed: true,
+    });
+    converted.value = `已建立全局草稿 ${v.data.name} v${v.revision}；样本保留原听审来源，尚未登记远端音色。请到素材库继续设置。`;
+    error.value = '';
+  } catch (e: any) {
+    error.value = e.message;
+  }
+}
 const take = ref<any>({
   version: 1,
   episode: null,
@@ -105,6 +132,7 @@ async function selectVoice(r: any) {
   try {
     const loaded = await api(`/records/${r.id}/versions/${r.revision}`);
     if (version !== editorVersion) return;
+    if (loaded.data.version !== 1) throw new Error('新版应用请在上方人物与声音中管理');
     current.value = loaded;
     draft.value = structuredClone(loaded.data);
     error.value = '';
@@ -114,8 +142,10 @@ async function selectVoice(r: any) {
 }
 </script>
 <template>
-  <section class="panel">
-    <h3>长期声音资料库</h3>
+  <ProjectVoices :project-id="projectId" :documents="documents" @refresh="emit('refresh')" />
+  <details class="panel">
+    <summary>旧声音资料、转换与导入对白采用</summary>
+    <h3>旧项目声音资料</h3>
     <button @click="createVoice">新建声音配置</button>
     <p>固定参考音色、发音与表演规范。H3 文字请求不能保证锁定音色，参考音频当前用于制作和听审。</p>
     <p class="error">{{ error }}</p>
@@ -139,6 +169,13 @@ async function selectVoice(r: any) {
       @select="(r) => (draft.entity = { id: r.id, revision: r.revision })"
     />
     <p>{{ draft.entity }}</p>
+    <button v-if="current" @click="previewConversion">预览转换到全局音色库</button>
+    <div v-if="conversion">
+      <p v-for="c in conversion.changes">{{ c }}</p>
+      <p>参考区间按原固定素材复制，旧资料与对白采用保持原版本；不会生成或上传到供应商。</p>
+      <button @click="convert">确认建立全局草稿</button>
+    </div>
+    <p v-if="converted">{{ converted }}</p>
     <RecordPicker
       :project-id="projectId"
       kind="asset"
@@ -173,5 +210,5 @@ async function selectVoice(r: any) {
         d.data.voice.revision
       }}
     </p>
-  </section>
+  </details>
 </template>

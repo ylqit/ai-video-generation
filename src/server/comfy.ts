@@ -27,6 +27,18 @@ export const models = {
   audio: 'minimax_h3_audio_vae_fp32.safetensors',
 };
 export function compileH3(input: any, files: Map<string, string>, jobId: string): Graph {
+  if (['canvas-h3-v1', 'canvas-h3-v2'].includes(input.templateVersion)) {
+    if (input.segment.mode === 'ref2va') {
+      const graph = compileNativeH3(
+        { ...input, segment: { ...input.segment, references: [] } },
+        new Map(),
+        jobId,
+      );
+      return attachGuidedH3(graph, input, files, input.prepared);
+    }
+    return compileNativeH3(input, files, jobId);
+  }
+
   if (
     [modularBaseTemplate, universalBaseTemplate, seriesBaseTemplate].includes(input.templateVersion)
   ) {
@@ -165,9 +177,13 @@ function compileNativeH3(input: any, files: Map<string, string>, jobId: string):
       (a: any) => a.reference.assetId === r.assetId && a.reference.revision === r.revision,
     )?.asset.data;
     const filename = files.get(
-      [modularBaseTemplate, universalBaseTemplate, seriesBaseTemplate].includes(
-        input.templateVersion,
-      )
+      [
+        modularBaseTemplate,
+        universalBaseTemplate,
+        seriesBaseTemplate,
+        'canvas-h3-v1',
+        'canvas-h3-v2',
+      ].includes(input.templateVersion)
         ? `${r.assetId}:${r.revision}`
         : r.assetId,
     );

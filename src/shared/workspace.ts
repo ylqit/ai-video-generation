@@ -9,6 +9,7 @@ import {
 } from './creation.js';
 import type { Job, RecordDoc } from './contracts.js';
 import { executionTextSchema, type ExecutionText } from './execution-text.js';
+import { incomingV2Schema } from './shot-semantics.js';
 
 // Execution needs visible subjects, offscreen speakers and boundary participants.
 // Use the same set for readiness, workspace requirement status and invalidation.
@@ -68,6 +69,11 @@ export const scopeInputSchema = z
     shotIds: z.array(z.string().min(1)).max(10000).default([]),
     groupIds: z.array(z.string().min(1)).max(10000).default([]),
     executionText: executionTextSchema.optional(),
+    continuations: z.record(z.string().min(1), incomingV2Schema).optional(),
+    experiment: creationRefSchema
+      .extend({ digest: z.string().length(64), caseId: z.string().min(1) })
+      .strict()
+      .optional(),
     output: creationSettingsSchema.shape.output
       .unwrap()
       .extend({ seed: z.number().int().nonnegative().default(0) })
@@ -76,6 +82,8 @@ export const scopeInputSchema = z
   .strict();
 export type ScopeInput = z.infer<typeof scopeInputSchema>;
 export interface CreationScope {
+  experiment?: { id: string; revision: number; digest: string; caseId: string };
+  continuations?: Record<string, z.infer<typeof incomingV2Schema>>;
   executionText?: ExecutionText;
   candidates?: { jobId: string; shotIds: string[]; reason: string }[];
   version: number;
@@ -96,7 +104,9 @@ export const workspaceLayoutSchema = z
     positions: z
       .record(z.string(), z.object({ x: z.number().finite(), y: z.number().finite() }).strict())
       .default({}),
-    view: z.enum(['canvas', 'storyboard', 'timeline']).default('canvas'),
+    view: z
+      .enum(['canvas', 'story', 'visual', 'storyboard', 'candidates', 'timeline'])
+      .default('canvas'),
     assistantWidth: z.number().min(340).max(560).default(400),
     assistantCollapsed: z.boolean().default(false),
     filters: z.record(z.string(), z.array(z.string())).default({}),
@@ -130,7 +140,23 @@ export interface WorkspaceCard {
   summary?: string;
 }
 export interface WorkspaceSnapshot {
+  productionRequirements?: {
+    fixed: import('./production-plan.js').EffectiveEpisodePlan | null;
+    current: import('./production-plan.js').EffectiveEpisodePlan;
+    predecessor: import('./production-plan.js').PredecessorStatus;
+  } | null;
+  storyCoverage?: Array<{
+    sceneId: string;
+    sceneTitle: string;
+    eventId: string;
+    description: string;
+    sources: any[];
+    shots: any[];
+    evidence: any[];
+    status: string;
+  }>;
   project: RecordDoc;
+  context?: WorkspaceContext;
   episodes: RecordDoc[];
   run: RecordDoc | null;
   results: Partial<Record<AuthoringStage, RecordDoc>>;
@@ -169,6 +195,28 @@ export interface WorkspaceSnapshot {
     actualFrames: number;
     adoptedFrames: number;
   };
+}
+export interface WorkspaceIssue {
+  code: string;
+  message: string;
+  severity: 'blocking' | 'review' | 'info';
+  gate: 'authoring' | 'prepare' | 'adopt' | 'deliver';
+  inScope: boolean;
+  target: CreationRef | null;
+  field: string;
+  shotId?: string;
+  requirementId?: string;
+  jobId?: string;
+  destination: 'series' | 'authoring' | 'references' | 'scope' | 'candidate' | 'delivery' | 'job';
+}
+export interface WorkspaceContext {
+  series: CreationRef | null;
+  episode: CreationRef | null;
+  profile: CreationRef | null;
+  selectionRequired: 'series' | 'episode' | 'run' | null;
+  seriesChoices: { id: string; revision: number; title: string }[];
+  runChoices: { id: string; revision: number; title: string; episodeId: string }[];
+  issues: WorkspaceIssue[];
 }
 export const scopedRevisionSchema = z
   .object({

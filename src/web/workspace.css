@@ -274,6 +274,18 @@ summary {
   flex: 1;
   min-height: 0;
 }
+.asset-library-shell {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+.asset-library-shell > .global-links {
+  height: 44px;
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--line);
+}
 .project-home > header,
 .page-heading {
   display: flex;
@@ -1843,4 +1855,18 @@ summary {
   .preview-heading {
     flex-wrap: wrap;
   }
+}
+
+.central-workspace.creation-scroll {
+  overflow-y: auto;
+}
+.central-workspace.creation-scroll > .panel {
+  flex-shrink: 0;
+  margin: 12px;
+}
+.assistant-dock > .bounded-assistant {
+  flex-shrink: 0;
+  max-height: 65%;
+  overflow-y: auto;
+  margin: 8px;
 }

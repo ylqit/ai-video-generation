@@ -2,6 +2,7 @@
 import { computed, onMounted, ref } from 'vue';
 import { api, assetUrl, downloadJson } from './api';
 import type { WorkspaceSnapshot } from '../shared/workspace';
+import ImageModelTask from './ImageModelTask.vue';
 const props = defineProps<{ requirement: any; snapshot: WorkspaceSnapshot }>();
 const emit = defineEmits(['close', 'refresh', 'bind']);
 const task = ref<any>(null),
@@ -118,18 +119,28 @@ async function deliver() {
       v-dialog-focus="() => emit('close')"
       role="dialog"
       aria-modal="true"
-      aria-label="Codex 素材任务"
+      aria-label="图片素材任务"
       @keydown.esc="emit('close')"
     >
       <header>
         <div>
-          <small>CODEX HANDOFF</small>
+          <small>图片制作与外部交接</small>
           <h2>{{ requirement.description }}</h2>
         </div>
         <button @click="emit('close')" aria-label="关闭">×</button>
       </header>
       <p v-if="error" class="error" role="alert">{{ error }}</p>
       <p v-if="notice" role="status">{{ notice }}</p>
+      <ImageModelTask
+        v-if="task"
+        :task="task"
+        @refresh="
+          async () => {
+            await loadTask(await api(`/records/${task.id}`));
+            emit('refresh');
+          }
+        "
+      />
       <div class="handoff-overview">
         <div>
           <h3>素材用途</h3>

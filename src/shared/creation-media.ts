@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { authoringStages, creationOverlaySchema, creationRefSchema } from './creation.js';
 import { scopedRevisionSchema } from './workspace.js';
+import { adaptationIntentSchema } from './adaptation.js';
 
 export const messageReferenceSchema = creationRefSchema
   .extend({
@@ -18,6 +19,7 @@ export const creationMessageSchema = z
     idempotencyKey: z.string().min(8),
     stage: z.enum(authoringStages).optional(),
     writable: scopedRevisionSchema.optional(),
+    adaptation: adaptationIntentSchema.optional(),
     action: z
       .object({ type: z.string().min(1) })
       .strict()

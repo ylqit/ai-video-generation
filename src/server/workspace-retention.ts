@@ -40,7 +40,16 @@ export async function retainWorkspace(sourceRoot: string, targetRoot: string, pr
     const versions = source
       .prepare('SELECT r.* FROM revisions r JOIN documents d ON d.id=r.id WHERE d.project_id=?')
       .all(projectId);
-    const jobs = source.prepare('SELECT * FROM jobs WHERE project_id=?').all(projectId);
+    // Workspace-owned voices stay globally owned. Preserve their fixed history, not a fake project.
+    const jobs = source
+      .prepare('SELECT * FROM jobs WHERE project_id=? OR project_id IS NULL')
+      .all(projectId);
+    const voiceMetadata = source.prepare('SELECT * FROM library_metadata').all();
+    const voiceIds = new Set(voiceMetadata.map((r) => r.id));
+    const libraryVersions = source
+      .prepare('SELECT * FROM library_versions')
+      .all()
+      .filter((r) => voiceIds.has(r.id));
     if (jobs.some((j) => j.batch_id))
       throw new Error('保留项目参与跨项目批次，需要先核对批次的完整保留范围');
     const jobIds = new Set(jobs.map((j) => String(j.id)));
@@ -88,13 +97,26 @@ export async function retainWorkspace(sourceRoot: string, targetRoot: string, pr
         );
       });
     const rowsByTable: Record<string, any[]> = {
+      library_items: source
+        .prepare('SELECT * FROM library_items')
+        .all()
+        .filter((r) => voiceIds.has(r.id)),
+      library_versions: libraryVersions,
+      voice_folders: source
+        .prepare(
+          `WITH RECURSIVE tree AS (SELECT *,0 depth FROM voice_folders WHERE parent_id IS NULL UNION ALL SELECT f.*,t.depth+1 FROM voice_folders f JOIN tree t ON f.parent_id=t.id) SELECT id,parent_id,name,revision FROM tree ORDER BY depth,id`,
+        )
+        .all(),
+      library_metadata: voiceMetadata,
       documents: records,
       revisions: versions,
       jobs,
       events,
       settings: source
-        .prepare("SELECT * FROM settings WHERE key IN ('comfy','discovery','maintenance')")
-        .all(),
+        .prepare(
+          "SELECT * FROM settings WHERE key IN ('comfy','discovery','maintenance','speech_allowance:workspace',?) OR key LIKE 'voice_probe:%'",
+        )
+        .all(`speech_allowance:project:${projectId}`),
       dependencies: dependencyRows,
       derivations: source.prepare('SELECT * FROM derivations WHERE project_id=?').all(projectId),
       proposal_applications: source
@@ -112,6 +134,24 @@ export async function retainWorkspace(sourceRoot: string, targetRoot: string, pr
           );
         }),
     };
+    // Retain fixed connection history referenced by this project's documents/jobs.
+    // DPAPI blobs remain encrypted and only work for the original Windows account.
+    const retainedText = JSON.stringify([versions, jobs, libraryVersions, rowsByTable.settings]);
+    const connectionRows = source
+      .prepare('SELECT * FROM model_connections')
+      .all()
+      .filter((r) => retainedText.includes(String(r.id)));
+    const connectionIds = new Set(connectionRows.map((r) => r.id));
+    rowsByTable.model_connections = connectionRows;
+    rowsByTable.model_connection_versions = source
+      .prepare('SELECT * FROM model_connection_versions')
+      .all()
+      .filter((r) => connectionIds.has(r.id));
+    const connectionText = JSON.stringify(rowsByTable.model_connection_versions);
+    rowsByTable.model_secrets = source
+      .prepare('SELECT * FROM model_secrets')
+      .all()
+      .filter((r) => connectionText.includes(String(r.id)));
     if (source.prepare("SELECT name FROM sqlite_master WHERE name='media_file_state'").get()) {
       const mediaPaths = new Set(
         versions
@@ -150,6 +190,10 @@ export async function retainWorkspace(sourceRoot: string, targetRoot: string, pr
       }
     });
     const assets = new Map<string, { path: string; sha256: string; bytes?: number }>();
+    for (const row of libraryVersions) {
+      const bundle = JSON.parse(String(row.bundle));
+      if (bundle.kind === 'voice_media') assets.set(bundle.data.path, bundle.data);
+    }
     for (const row of versions) {
       const doc = JSON.parse(String(row.document));
       if (doc.kind === 'asset' && doc.data.path) {
@@ -257,6 +301,7 @@ export async function retainWorkspace(sourceRoot: string, targetRoot: string, pr
       assets: manifest,
       jobs: jobs.map((j) => ({ id: j.id, promptId: j.prompt_id, state: j.state })),
       sourceUnchanged: true,
+      globalVoices: '全局声音身份、音频、目录及工作区任务完整保留；项目归属不变',
     };
     await fs.writeFile(
       path.join(targetRoot, 'retention-manifest.json'),

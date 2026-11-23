@@ -1,0 +1,206 @@
+@media (max-width: 1250px) {
+  .creative-grid {
+    grid-template-columns: 175px minmax(180px, 1fr) 290px;
+  }
+  .work-bar {
+    flex-wrap: wrap;
+    gap: 7px;
+  }
+  .work-bar .view-tabs {
+    order: 3;
+    width: 100%;
+  }
+  .work-identity {
+    flex: 1;
+  }
+  .work-bar {
+    min-height: 100px;
+  }
+  .inspector-rail {
+    padding: 14px;
+  }
+  .resource-rail {
+    padding: 18px 10px;
+  }
+  .project-home,
+  .asset-library-shell,
+  .settings-workspace {
+    padding: 28px;
+  }
+  .settings-grid {
+    grid-template-columns: 175px minmax(0, 1fr);
+  }
+}
+@media (max-width: 900px) {
+  .creative-grid {
+    grid-template-columns: 160px minmax(0, 1fr);
+    overflow: auto;
+  }
+  .inspector-rail {
+    grid-column: 1/-1;
+    border-top: 1px solid var(--studio-line);
+    overflow: visible;
+  }
+  .flow-surface {
+    height: 540px;
+  }
+  .resource-rail {
+    max-height: 540px;
+  }
+  .node-inspector,
+  .agent-panel {
+    max-width: 680px;
+    margin: auto;
+  }
+  .settings-grid {
+    grid-template-columns: 1fr;
+  }
+  .settings-grid > nav {
+    display: flex;
+    overflow: auto;
+    position: static;
+  }
+  .settings-grid > nav button {
+    white-space: nowrap;
+  }
+  .edit-workspace {
+    grid-template-columns: 160px minmax(0, 1fr);
+  }
+  .edit-main {
+    padding: 18px;
+  }
+  .library-toolbar {
+    flex-wrap: wrap;
+  }
+  .creative-workspace {
+    height: auto;
+    min-height: calc(100vh - 62px);
+  }
+  .edit-workspace {
+    overflow: visible;
+  }
+  .edit-main {
+    overflow: visible;
+  }
+}
+@media (max-width: 600px) {
+  .global-nav {
+    padding: 0 12px;
+    gap: 8px;
+  }
+  .global-nav .studio-brand span {
+    display: none;
+  }
+  .global-links button {
+    padding: 9px 10px;
+  }
+  .global-links button > span:first-child {
+    display: none;
+  }
+  .project-switch {
+    max-width: 90px;
+    font-size: 11px;
+  }
+  .project-home,
+  .asset-library-shell,
+  .settings-workspace {
+    padding: 24px 16px;
+  }
+  .page-heading h1,
+  .project-home h1 {
+    font-size: 24px;
+  }
+  .creative-grid {
+    grid-template-columns: 1fr;
+  }
+  .resource-rail {
+    max-height: 190px;
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    border-bottom: 1px solid var(--studio-line);
+  }
+  .resource-rail .eyebrow {
+    width: 100%;
+  }
+  .resource-rail input {
+    width: 140px;
+  }
+  .resource-item {
+    max-width: 150px;
+  }
+  .resource-item img,
+  .resource-symbol {
+    width: 28px;
+    height: 28px;
+  }
+  .resource-rail .rail-section {
+    width: auto;
+  }
+  .rail-actions {
+    margin: 0;
+  }
+  .flow-surface {
+    height: 480px;
+  }
+  .canvas-toolbar {
+    left: 10px;
+    top: 10px;
+    max-width: calc(100% - 20px);
+  }
+  .work-bar {
+    padding: 10px;
+  }
+  .work-identity strong {
+    max-width: 90px;
+  }
+  .work-identity select {
+    max-width: 130px;
+  }
+  .edit-workspace {
+    display: block;
+  }
+  .edit-bin {
+    max-height: 180px;
+    overflow: auto;
+  }
+  .edit-bin-item {
+    width: 160px;
+    display: inline-flex;
+    margin: 5px;
+  }
+  .edit-player {
+    min-height: 140px;
+  }
+  .playback-controls span {
+    font-size: 10px;
+  }
+  .document-stage {
+    padding: 14px;
+  }
+  .document-paper {
+    padding: 18px;
+  }
+  .settings-grid > nav {
+    gap: 0;
+  }
+  .settings-grid > nav button {
+    font-size: 12px;
+    padding: 10px;
+  }
+  .project-grid {
+    grid-template-columns: 1fr;
+  }
+  .media-card-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+  }
+  .media-card img,
+  .media-card video,
+  .audio-cover {
+    height: 120px;
+  }
+  .task-center {
+    padding: 24px 14px !important;
+  }
+}

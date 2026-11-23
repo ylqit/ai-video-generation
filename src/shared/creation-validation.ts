@@ -414,8 +414,15 @@ export function validateAuthoringResult(
   return issues;
 }
 
-export function authoringExecutionIssues(director: DirectorResult): CreationIssue[] {
-  const caps = H3_CREATION_CAPABILITIES;
+export function authoringExecutionIssues(
+  director: DirectorResult,
+  caps: {
+    provider: string;
+    minSeconds: number;
+    maxSeconds: number;
+    framesPerSecond: number;
+  } = H3_CREATION_CAPABILITIES,
+): CreationIssue[] {
   return director.groups.flatMap((group) => {
     const frames = group.shotIds.reduce(
       (n, id) => n + (director.shots.find((s) => s.id === id)?.frames || 0),
@@ -431,7 +438,7 @@ export function authoringExecutionIssues(director: DirectorResult): CreationIssu
             stage: 'production',
             field: `groups.${group.id}`,
             targetId: '',
-            message: `H3 单次支持 ${caps.minSeconds}–${caps.maxSeconds} 秒；本单元为 ${frames / 24} 秒。请在已完成节拍处分组，或修改采用时间线。`,
+            message: `${caps.provider === 'h3' ? 'H3' : caps.provider} 单次支持 ${caps.minSeconds}–${caps.maxSeconds} 秒；本单元为 ${frames / 24} 秒。请在已完成节拍处分组，或修改采用时间线。`,
           },
         ]
       : [];

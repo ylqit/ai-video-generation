@@ -8,6 +8,7 @@ import { referencePlanSchema } from '../shared/domain.js';
 import type { RecordDoc, ComfyProfile } from '../shared/contracts.js';
 import { resolveCreativeBrief } from './creative-brief.js';
 import type { CreationRef } from '../shared/creation.js';
+import { ModelRegistry } from './model-registry.js';
 
 export class ReadinessService {
   constructor(public store: Store) {}
@@ -20,28 +21,12 @@ export class ReadinessService {
     );
   }
   generation(raw: any, profile: ComfyProfile, scope?: CreationRef) {
-    if (!profile?.baseUrl || !profile.instanceId) throw new HttpError(400, '请先配置云端连接');
     const ep = this.store.get(raw.episodeId);
-    const project = this.store.get(ep.projectId);
-    // Only continuity-dependent scenes wait for prior canon; independent shorts do not.
     if (
-      project.data.mode === 'series' &&
-      ep.data.number > 1 &&
-      !ep.data.segments?.find((s: any) => s.id === raw.segmentId)?.incoming &&
-      ep.data.incoming?.inheritPrevious !== false
-    ) {
-      const previous = this.store
-        .list('episode', ep.projectId)
-        .filter((e) => e.data.seriesId === ep.data.seriesId && e.data.number < ep.data.number)
-        .sort((a, b) => b.data.number - a.data.number)[0];
-      if (
-        previous &&
-        !this.store
-          .list('continuity', ep.projectId)
-          .some((c) => c.parentId === previous.id && c.data.confirmed && !c.data.stale)
-      )
-        throw new HttpError(409, '前集剧情状态尚未确认；独立片段可在入集要求中明确不继承');
-    }
+      (!profile?.baseUrl || !profile.instanceId) &&
+      !new ModelRegistry(this.store).resolve(ep.projectId, ep.id, 'video', raw.segmentId)
+    )
+      throw new HttpError(400, '请先配置模型连接');
     const prepared = new StudioService(this.store).prepareGeneration(raw, profile, scope);
     return prepared;
   }
@@ -94,7 +79,7 @@ export class ReadinessService {
           );
       }
       if (doc.data.stale)
-        add(doc, 'stale', doc.data.staleReason || '依据已经变化，需要复核', 'planning', 'blocking');
+        add(doc, 'stale', doc.data.staleReason || '依据已经变化，需要复核', 'planning', 'review');
       if (doc.kind === 'proposal' && !doc.data.approved)
         add(doc, 'proposal_review', doc.data.proposal?.summary || '导演提案待确认', 'planning');
       if (
@@ -135,8 +120,6 @@ export class ReadinessService {
           add(doc, 'shots_missing', '尚未建立分镜', 'shots', 'blocking', extra);
         for (const segment of doc.data.segments || []) {
           try {
-            if (!doc.data.approved || doc.data.stale)
-              throw new HttpError(409, '分集需先审核，或已发生版本变化');
             this.generation(
               {
                 episodeId: doc.id,

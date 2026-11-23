@@ -11,14 +11,88 @@ const props = defineProps<{
   subjectKey?: string;
 }>();
 const emit = defineEmits(['close', 'saved']);
-const draftKey = `studio-draft:${props.record.id}:${props.record.revision}:${props.shotId || props.sceneId || props.subjectKey || 'all'}`;
-const original = JSON.stringify(props.record.data.result),
-  recovered = localStorage.getItem(draftKey);
-const draft = ref<any>(JSON.parse(recovered || original)),
+const objectKey = props.shotId || props.sceneId || props.subjectKey || 'all';
+const legacyKey = `studio-draft:${props.record.id}:${props.record.revision}:${objectKey}`;
+const draftKey = `studio-authoring-draft:${props.record.projectId}:${props.run.id}:${props.record.data.stage}:${objectKey}`;
+const original = JSON.stringify(props.record.data.result);
+let recovered: any = null;
+const recoveryError = ref(''),
+  recoveredRaw = ref('');
+try {
+  recoveredRaw.value = localStorage.getItem(draftKey) || localStorage.getItem(legacyKey) || '';
+  recovered = JSON.parse(localStorage.getItem(draftKey) || 'null');
+  if (!recovered && localStorage.getItem(legacyKey))
+    recovered = {
+      baseline: { id: props.record.id, revision: props.record.revision },
+      result: JSON.parse(localStorage.getItem(legacyKey)!),
+    };
+  if (recovered) {
+    const candidate = recovered.result;
+    if (
+      !candidate ||
+      typeof candidate !== 'object' ||
+      candidate.stage !== props.record.data.result.stage ||
+      Object.entries(props.record.data.result).some(
+        ([key, value]) =>
+          Array.isArray(value) &&
+          (!Array.isArray(candidate[key]) || candidate[key].some((item: any) => item === null)),
+      )
+    )
+      throw new Error('草稿结构与打开的阶段不符');
+  }
+} catch {
+  recovered = null;
+  recoveryError.value = '本地草稿无法解析，当前打开固定原稿；原存储保留供恢复。';
+}
+const conflict = ref(
+  recovered &&
+    (recovered.baseline?.id !== props.record.id ||
+      recovered.baseline?.revision !== props.record.revision)
+    ? recovered
+    : null,
+);
+const draft = ref<any>(
+    JSON.parse(
+      JSON.stringify(
+        !conflict.value && recovered?.result ? recovered.result : props.record.data.result,
+      ),
+    ),
+  ),
   error = ref(''),
   busy = ref(false),
-  notice = ref(recovered ? '已恢复本地未保存编辑。' : '');
+  notice = ref(
+    recoveryError.value ||
+      (conflict.value
+        ? '发现旧版本草稿。请比较后明确保留内容，不会覆盖当前原稿。'
+        : recovered
+          ? '已恢复本地未保存编辑。'
+          : ''),
+  );
 const dirty = computed(() => JSON.stringify(draft.value) !== original);
+const impact = ref<any>(null);
+async function inspectImpact() {
+  try {
+    const contents = JSON.stringify(draft.value);
+    const response = await api(`/creation-runs/${props.run.id}/results/impact`, 'POST', {
+      revision: runRevision,
+      baseline: { id: props.record.id, revision: props.record.revision },
+      stage: draft.value.stage,
+      result: draft.value,
+      ...(props.shotId || props.sceneId || props.subjectKey
+        ? {
+            scope: {
+              shotIds: props.shotId ? [props.shotId] : [],
+              sceneIds: props.sceneId ? [props.sceneId] : [],
+              subjectKeys: props.subjectKey ? [props.subjectKey] : [],
+            },
+          }
+        : {}),
+    });
+    if (JSON.stringify(draft.value) === contents) impact.value = response;
+  } catch (e: any) {
+    error.value = e.message;
+  }
+}
 const runRevision = props.run.revision;
 const shots = computed(() =>
   props.shotId ? draft.value.shots.filter((s: any) => s.id === props.shotId) : draft.value.shots,
@@ -118,8 +192,21 @@ const previousFocus = document.activeElement as HTMLElement | null;
 watch(
   draft,
   () => {
-    if (dirty.value) localStorage.setItem(draftKey, JSON.stringify(draft.value));
-    else localStorage.removeItem(draftKey);
+    impact.value = null;
+    if (conflict.value || recoveryError.value) return;
+    try {
+      if (dirty.value)
+        localStorage.setItem(
+          draftKey,
+          JSON.stringify({
+            baseline: { id: props.record.id, revision: props.record.revision },
+            result: draft.value,
+          }),
+        );
+      else localStorage.removeItem(draftKey);
+    } catch {
+      notice.value = '本地空间不足，草稿尚未持久保存，请复制保存。';
+    }
   },
   { deep: true },
 );
@@ -136,6 +223,15 @@ function reorder(index: number, direction: number) {
   );
 }
 async function save() {
+  if (props.record.data.adopted && !impact.value) {
+    await inspectImpact();
+    notice.value = '请检查修改影响，再提交草稿。';
+    return;
+  }
+  if (conflict.value || recoveryError.value) {
+    error.value = '请先处理草稿恢复问题，避免覆盖尚未保存的内容。';
+    return;
+  }
   if (props.run.data.schemaVersion !== 9) {
     error.value = '当前编辑器仅支持 V9 作者结果';
     return;
@@ -160,12 +256,45 @@ async function save() {
           }
         : {}),
     });
-    localStorage.removeItem(draftKey);
+    try {
+      localStorage.removeItem(draftKey);
+      localStorage.removeItem(legacyKey);
+    } catch {
+      notice.value = '服务端草稿已保存；本机旧草稿未清除，下次打开时请核对版本。';
+    }
     emit('saved', result);
   } catch (e: any) {
-    error.value = e.message + '。当前编辑已保留在本机，可复制草稿或关闭后重新打开比较。';
+    error.value =
+      e.message + '。当前编辑仍保留在此窗口，可复制草稿；本机持久保存状态请查看上方提示。';
   } finally {
     busy.value = false;
+  }
+}
+async function copyConflict() {
+  try {
+    await navigator.clipboard.writeText(JSON.stringify(conflict.value.result, null, 2));
+    notice.value = '旧草稿已复制，可与当前原稿比较。';
+  } catch (e: any) {
+    error.value = `复制失败：${e.message}`;
+  }
+}
+function discardConflict() {
+  try {
+    localStorage.removeItem(draftKey);
+    conflict.value = null;
+    notice.value = '继续编辑当前原稿；已明确放弃旧草稿。';
+  } catch (e: any) {
+    error.value = `清除失败：${e.message}`;
+  }
+}
+function discardUnreadable() {
+  try {
+    localStorage.removeItem(draftKey);
+    localStorage.removeItem(legacyKey);
+    recoveryError.value = '';
+    notice.value = '已明确放弃无法解析的存储，可继续编辑当前原稿。';
+  } catch (e: any) {
+    error.value = `清除失败：${e.message}`;
   }
 }
 async function copyDraft() {
@@ -199,6 +328,35 @@ onBeforeUnmount(() => previousFocus?.focus());
       </header>
       <p v-if="notice" role="status">{{ notice }}</p>
       <p v-if="error" role="alert" class="error">{{ error }}</p>
+      <details v-if="recoveryError" open>
+        <summary>无法解析的草稿存储</summary>
+        <textarea :value="recoveredRaw" readonly aria-label="原始草稿存储" />
+        <p>可先复制以上原文保留，再决定是否清除。</p>
+        <button type="button" @click="discardUnreadable">清除损坏存储，继续当前原稿</button>
+      </details>
+      <details v-if="conflict">
+        <summary>比较旧版本草稿与当前原稿</summary>
+        <pre>{{ JSON.stringify(conflict.result, null, 2) }}</pre>
+        <button type="button" @click="copyConflict">复制旧草稿</button
+        ><button type="button" @click="discardConflict">放弃旧草稿，编辑当前版本</button>
+      </details>
+      <p role="status">
+        {{ dirty ? '有未提交修改（本机草稿）' : '与打开的固定版本一致' }} · 提交后仍需审稿采用
+      </p>
+      <details v-if="record.data.adopted" open>
+        <summary>修改影响</summary>
+        <button type="button" @click="inspectImpact">重新核对影响</button
+        ><template v-if="impact"
+          ><p>字段：{{ impact.changedFields.join('、') || '无变化' }}</p>
+          <p v-for="s in impact.scopes" :key="s.id">
+            {{ s.name }}：{{
+              s.problem || (s.affected ? '实际消费内容改变，需重新准备' : '执行内容保持')
+            }}
+          </p>
+          <p v-for="j in impact.jobs" :key="j.id">{{ j.id }} · {{ j.state }} · {{ j.action }}</p>
+          <p>{{ impact.facts }}</p></template
+        >
+      </details>
       <div class="editor-scroll">
         <fieldset class="editor-fields" :disabled="busy || run.data.schemaVersion !== 9">
           <template v-if="!shotId && !sceneId && !subjectKey"

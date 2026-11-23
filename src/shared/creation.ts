@@ -1,4 +1,7 @@
 import { z } from 'zod';
+import type { ModelExecution } from './models.js';
+import type { EffectiveEpisodePlan, PredecessorStatus } from './production-plan.js';
+import type { AdaptationIntent } from './adaptation.js';
 import {
   sceneDesignSchema,
   shotStagingSchema,
@@ -45,6 +48,7 @@ export const creationSettingsSchema = z
         width: z.number().int().min(128).max(3840).multipleOf(2).default(864),
         height: z.number().int().min(128).max(3840).multipleOf(2).default(480),
         steps: z.number().int().min(1).max(50).default(20),
+        mismatch: z.enum(['require_match', 'letterbox']).optional(),
       })
       .strict()
       .default({ width: 864, height: 480, steps: 20 }),
@@ -62,9 +66,20 @@ export const creationSettingsSchema = z
 export type CreationSettings = z.infer<typeof creationSettingsSchema>;
 
 export function inferDurationIntent(request: string): DurationIntent {
-  const match = request.match(
-    /(大约|约|大概)?\s*(\d+(?:\.\d+)?|一|两|二|三|四|五|六|七|八|九|十|半)\s*(分钟|秒钟|秒)(左右|上下)?/,
-  );
+  const matches = [
+    ...request.matchAll(
+      /(大约|约|大概)?\s*(\d+(?:\.\d+)?|一|两|二|三|四|五|六|七|八|九|十|半)\s*(分钟|秒钟|秒)(左右|上下)?/g,
+    ),
+  ];
+  const match = matches.find((m) => {
+    const prefix = request.slice(Math.max(0, m.index! - 18), m.index);
+    const suffix = request.slice(m.index! + m[0].length, m.index! + m[0].length + 10);
+    return (
+      !/(开头|结尾|这一镜|镜头|片头|片尾|停顿|动作|转场|前|后)\s*(?:持续|约|大约|为|用|需要)?\s*$/.test(
+        prefix,
+      ) && !/^\s*(?:的)?(?:镜头|片头|片尾|停顿|动作|转场)/.test(suffix)
+    );
+  });
   if (!match) return { mode: 'derive' };
   const chinese: Record<string, number> = {
     一: 1,
@@ -438,7 +453,10 @@ export function parseAuthoringResult(stage: AuthoringStage, raw: unknown): Autho
 
 export interface AuthoringContext {
   schemaVersion: 9;
+  modelExecution?: ModelExecution;
+  executionRevision?: 1;
   contractRevision?: 2;
+  localProtocol?: 'local-authoring-v1';
   runId: string;
   epoch: number;
   stage: AuthoringStage;
@@ -446,6 +464,10 @@ export interface AuthoringContext {
   target: CreationRef;
   projectId: string;
   settings: CreationSettings;
+  effectivePlan?: EffectiveEpisodePlan;
+  predecessor?: PredecessorStatus;
+  adaptation?: AdaptationIntent;
+  subjectBindings?: unknown[];
   dependencies: CreationRef[];
   records: Array<{ id: string; revision: number; kind: string; data: unknown }>;
   priorResults: Partial<Record<AuthoringStage, AuthoringResult>>;
@@ -459,14 +481,14 @@ export interface AuthoringContext {
   repairIssues: CreationIssue[];
   rules: { version: string; text: string; digest: string; files: string[] };
   capabilities: {
-    provider: 'h3';
+    provider: string;
     video: boolean;
-    image: false;
+    image: boolean;
     audio: false;
     mediaReview: false;
     framesPerSecond: 24;
-    minSeconds: 5;
-    maxSeconds: 15;
+    minSeconds: number;
+    maxSeconds: number;
   };
   digest: string;
 }

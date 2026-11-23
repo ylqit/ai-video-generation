@@ -1,6 +1,7 @@
 node_modules/
 dist/
 .data/
+.idea
 .env
 *.log
 test-results/
@@ -17,4 +18,13 @@ productions/**/.render-checkpoint.json
 /output
 /productions
 /skills
-/tests
+!/skills/
+/skills/*
+!/skills/studio-director/
+/skills/studio-director/*
+!/skills/studio-director/references/
+/skills/studio-director/references/*
+!/skills/studio-director/references/stages-v9/
+/.artifacts/
+/tests/.artifacts/
+/tests/browser/.cache/

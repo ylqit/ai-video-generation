@@ -1,4 +1,7 @@
 <script setup lang="ts">
+import VisualTransitions from './VisualTransitions.vue';
+import { timelineMap } from '../shared/edit-timeline';
+import TimelinePlayback from './TimelinePlayback.vue';
 import AssemblyReview from './AssemblyReview.vue';
 import RecordPicker from './RecordPicker.vue';
 import ContractField from './ContractField.vue';
@@ -127,13 +130,13 @@ function add(id: string, audio = false) {
   const asset = media(id);
   if (!asset) return;
   const clip = {
+    ...(edl.value.schemaVersion === 3 && !audio ? { id: crypto.randomUUID() } : {}),
     assetId: id,
     revision: asset.revision,
     in: 0,
-    out:
-      edl.value.schemaVersion === 2
-        ? Math.floor((asset.data.duration || 5) * 24) / 24
-        : asset.data.duration || 5,
+    out: !!edl.value.schemaVersion
+      ? Math.floor((asset.data.duration || 5) * 24) / 24
+      : asset.data.duration || 5,
     volume: 1,
   };
   if (audio) edl.value.audio.push({ ...clip, start: 0 });
@@ -154,6 +157,7 @@ function stop() {
   for (const el of elements.values()) el.pause();
 }
 function sync() {
+  if (edl.value.schemaVersion === 3) return;
   let start = 0,
     index = 0;
   for (; index < edl.value.clips.length - 1; index++) {
@@ -196,7 +200,7 @@ function sync() {
   }
 }
 function tick(t: number) {
-  if (!playing.value) return;
+  if (!playing.value || edl.value.schemaVersion === 3) return;
   if (lastTime)
     position.value = Math.min(playEnd.value ?? total.value, position.value + (t - lastTime) / 1000);
   lastTime = t;
@@ -285,7 +289,24 @@ onBeforeUnmount(stop);
     </div>
     <p class="error" v-if="error">{{ error }}</p>
     <p v-if="notice">{{ notice }}</p>
-    <div class="preview" :style="{ aspectRatio: `${edl.width}/${edl.height}` }">
+    <VisualTransitions v-model="edl" />
+    <TimelinePlayback
+      v-if="edl.schemaVersion === 3"
+      :edl="edl"
+      :assets="[...assets, ...Object.values(frozenMedia)]"
+      :frame="Math.round(position * 24)"
+      :playing="playing"
+      @frame="
+        position = $event / 24;
+        if (playEnd !== null && position >= playEnd) stop();
+      "
+      @end="stop"
+      @error="
+        error = $event;
+        stop();
+      "
+    />
+    <div v-else class="preview" :style="{ aspectRatio: `${edl.width}/${edl.height}` }">
       <template v-for="(c, i) in edl.clips" :key="i + '-' + c.assetId"
         ><img
           v-if="media(c.assetId, c.revision)?.data.mediaType === 'image'"
@@ -324,7 +345,7 @@ onBeforeUnmount(stop);
       <label>画布宽<input type="number" step="2" v-model.number="edl.width" /></label
       ><label>画布高<input type="number" step="2" v-model.number="edl.height" /></label>
     </div>
-    <p v-if="edl.schemaVersion === 2">
+    <p v-if="!!edl.schemaVersion">
       帧时间线 · {{ Math.round(total * 24) }} 帧 · 入点和出点按 1/24
       秒填写；保存时拒绝非整帧区间。图片放大不改变原始生成分辨率。
     </p>
@@ -368,7 +389,7 @@ onBeforeUnmount(stop);
         }
       "
     />
-    <div v-if="episode.data.seriesProduction">
+    <div>
       <RecordPicker
         :project-id="episode.projectId"
         kind="dialogue_take"
@@ -376,6 +397,10 @@ onBeforeUnmount(stop);
         @select="
           async (r) => {
             const take = await api(`/records/${r.id}/versions/${r.revision}`);
+            if (take.data.sampleRange && edl.schemaVersion !== 3) {
+              error = '请先创建 EDL v3 草稿，以保存实际声音采样边界。';
+              return;
+            }
             edl.audio.push({
               assetId: take.data.asset.id,
               revision: take.data.asset.revision,
@@ -384,6 +409,7 @@ onBeforeUnmount(stop);
               start: 0,
               volume: 1,
               dialogueTake: { id: r.id, revision: r.revision },
+              ...(take.data.sampleRange ? { sampleRange: take.data.sampleRange } : {}),
               originalAudio: 'muted',
               lipSyncReviewed: false,
             });
@@ -401,7 +427,7 @@ onBeforeUnmount(stop);
           <option value="recap">回顾</option>
         </select></label
       ><span>{{ i + 1 }}. {{ media(c.assetId)?.data.name }} · v{{ c.revision }}</span
-      ><template v-if="edl.schemaVersion === 2"
+      ><template v-if="!!edl.schemaVersion"
         ><label
           >入点帧<input
             type="number"
@@ -439,11 +465,15 @@ onBeforeUnmount(stop);
       >
         移除
       </button>
-      <template v-if="edl.schemaVersion === 2"
+      <template v-if="!!edl.schemaVersion"
         ><label
-          >淡入帧<input type="number" min="0" step="1" v-model.number="c.fadeInFrames" /></label
+          >声音淡入帧<input type="number" min="0" step="1" v-model.number="c.fadeInFrames" /></label
         ><label
-          >淡出帧<input type="number" min="0" step="1" v-model.number="c.fadeOutFrames" /></label
+          >声音淡出帧<input
+            type="number"
+            min="0"
+            step="1"
+            v-model.number="c.fadeOutFrames" /></label
       ></template>
     </div>
     <select
@@ -463,7 +493,22 @@ onBeforeUnmount(stop);
     <h3>外部音轨</h3>
     <div class="clip-row" v-for="(c, i) in edl.audio">
       <span>{{ media(c.assetId)?.data.name }}</span
-      ><template v-if="edl.schemaVersion === 2"
+      ><template v-if="c.sampleRange"
+        ><label
+          >开始帧<input
+            type="number"
+            min="0"
+            step="1"
+            :value="Math.round(c.start * 24)"
+            @input="c.start = ($event.target as HTMLInputElement).valueAsNumber / 24" /></label
+        ><span
+          >源采样 [{{ c.sampleRange.inSample }}, {{ c.sampleRange.outSample }}) /
+          {{ c.sampleRange.sampleRate }} Hz；{{ c.in }}–{{
+            c.out
+          }}
+          秒。修改源区间需重新听审采用。</span
+        ></template
+      ><template v-else-if="!!edl.schemaVersion"
         ><label
           >开始帧<input
             type="number"
@@ -501,11 +546,15 @@ onBeforeUnmount(stop);
       >
         移除
       </button>
-      <template v-if="edl.schemaVersion === 2"
+      <template v-if="!!edl.schemaVersion"
         ><label
-          >淡入帧<input type="number" min="0" step="1" v-model.number="c.fadeInFrames" /></label
+          >声音淡入帧<input type="number" min="0" step="1" v-model.number="c.fadeInFrames" /></label
         ><label
-          >淡出帧<input type="number" min="0" step="1" v-model.number="c.fadeOutFrames" /></label
+          >声音淡出帧<input
+            type="number"
+            min="0"
+            step="1"
+            v-model.number="c.fadeOutFrames" /></label
       ></template>
     </div>
     <select
@@ -525,7 +574,8 @@ onBeforeUnmount(stop);
       </option>
     </select>
     <p class="muted">
-      音量设为 0 即静音；片段硬切，按顺序拼接；图片时长由出点指定。复杂转场和字幕暂不启用。
+      音量设为 0
+      即静音；画面转场与声音包络独立。图片时长由出点指定；改变重叠后请检查外部音轨与字幕坐标。
     </p>
   </section>
 </template>

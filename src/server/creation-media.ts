@@ -5,6 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { Store, HttpError } from './db.js';
 import { CreationService } from './creation.js';
+import { ModelRegistry } from './model-registry.js';
 import { authoringPrompt } from './creation-prompts.js';
 import { DomainService } from './domain-service.js';
 import { WorkspaceService, resolveScope } from './workspace.js';
@@ -19,6 +20,7 @@ import {
 } from '../shared/creation-media.js';
 import { creationRefSchema } from '../shared/creation.js';
 import { fileCleared } from './media-retention.js';
+import { fixedSeriesRecord } from './series-production.js';
 
 export class CreationMediaService {
   constructor(
@@ -38,8 +40,8 @@ export class CreationMediaService {
                 requirementId: z.string().min(1),
                 asset: creationRefSchema,
                 asGroupStart: z.boolean().optional(),
-                inspected: z.literal(true),
-                conclusion: z.string().trim().min(1),
+                inspected: z.boolean().default(false),
+                conclusion: z.string().trim().default(''),
               })
               .strict(),
           )
@@ -164,6 +166,13 @@ export class CreationMediaService {
         const context = {
           schemaVersion: 9,
           mode: 'discussion',
+          modelExecution:
+            new ModelRegistry(this.store).resolve(
+              run.projectId,
+              run.data.episodeId,
+              'text',
+              'discussion',
+            ) || undefined,
           projectId: run.projectId,
           runId,
           epoch: run.data.epoch,
@@ -189,12 +198,25 @@ export class CreationMediaService {
           'creative',
           run.projectId,
           run.data.episodeId,
-          { context, creationRunId: runId, messageKey: body.idempotencyKey },
+          {
+            context,
+            ...(context.modelExecution ? { modelExecution: context.modelExecution } : {}),
+            creationRunId: runId,
+            messageKey: body.idempotencyKey,
+          },
           `discussion:${runId}:${body.idempotencyKey}`,
         );
       } else if (body.mode === 'revise') {
         if (!body.stage) throw new HttpError(400, '修订需要明确阶段');
-        next = creation.revise(runId, body.stage, body.request, [], false, body.writable);
+        next = creation.revise(
+          runId,
+          body.stage,
+          body.request,
+          [],
+          false,
+          body.writable,
+          body.adaptation,
+        );
         at = next.data.messages.at(-1).at;
         const context = creation.context(runId, body.stage);
         context.records.push(
@@ -217,7 +239,12 @@ export class CreationMediaService {
           'creative',
           run.projectId,
           run.data.episodeId,
-          { context, creationRunId: runId, messageKey: body.idempotencyKey },
+          {
+            context,
+            ...(context.modelExecution ? { modelExecution: context.modelExecution } : {}),
+            creationRunId: runId,
+            messageKey: body.idempotencyKey,
+          },
           `revision:${runId}:${body.idempotencyKey}`,
         );
         next = this.store.update(next.id, next.revision, {
@@ -287,6 +314,8 @@ export class CreationMediaService {
   }
 
   completeDiscussion(job: Job, raw: unknown) {
+    if (!job.projectId) throw new HttpError(400, '讨论任务需要项目归属');
+    const projectId = job.projectId;
     const context = job.input.context,
       parsed = discussionResponseSchema.parse(raw);
     if (
@@ -302,12 +331,12 @@ export class CreationMediaService {
     return this.store.transaction(() => {
       const run = new CreationService(this.store).get(context.runId);
       const prior = this.store
-        .list('creation_message', job.projectId)
+        .list('creation_message', projectId)
         .find((m) => m.data.jobId === job.id && m.data.role === 'assistant');
       if (prior) return prior;
       const message = this.store.create(
         'creation_message',
-        job.projectId,
+        projectId,
         {
           role: 'assistant',
           mode: 'discuss',
@@ -392,7 +421,9 @@ export class CreationMediaService {
           t.data.assetsResult.id === assetsRef.id &&
           t.data.assetsResult.revision === assetsRef.revision &&
           t.data.scriptResult?.id === scriptRef.id &&
-          t.data.scriptResult.revision === scriptRef.revision,
+          t.data.scriptResult.revision === scriptRef.revision &&
+          t.data.directionResult?.id === run.data.results.direction?.id &&
+          t.data.directionResult?.revision === run.data.results.direction?.revision,
       );
       if (current && current.data.maxRevisions !== body.maxRevisions)
         throw new HttpError(409, '当前任务已有固定修订预算，请使用现有任务包');
@@ -425,8 +456,16 @@ export class CreationMediaService {
       const oldEntity = this.store
         .list('entity', run.projectId)
         .find((e) => e.data.instances?.some((i: any) => i.id === entityData.instances[0].id));
-      let entity = oldEntity;
-      if (!entity || entity.data.handoffDigest !== entityDigest) {
+      const binding = run.data.subjectBindings?.find(
+        (b: any) =>
+          b.subjectKey === subject.key &&
+          b.subjectDigest === generationDigest(subject) &&
+          b.decision === 'reuse',
+      );
+      let entity = binding
+        ? fixedSeriesRecord(this.store, run.projectId, binding.entity, 'entity')
+        : oldEntity;
+      if (!binding && (!entity || entity.data.handoffDigest !== entityDigest)) {
         const saved = domain.save(
           run.projectId,
           'entity',
@@ -441,7 +480,7 @@ export class CreationMediaService {
       }
       const task = domain.save(run.projectId, 'asset_task', {
         name: requirement.description || requirement.id,
-        entity: { id: entity.id, revision: entity.revision },
+        entity: { id: entity!.id, revision: entity!.revision },
         requirements: `${requirement.description}\n${requirement.prompt}\n版式：${requirement.layout}`,
         views: [{ id: requirement.id, view: requirement.view, instruction: requirement.prompt }],
         references: [],
@@ -454,6 +493,7 @@ export class CreationMediaService {
         shotIds: requirement.shotIds,
         assetsResult: assetsRef,
         scriptResult: scriptRef,
+        directionResult: run.data.results.direction || null,
         maxRevisions: body.maxRevisions,
         state: 'waiting_codex',
         receipts: [{ key: body.idempotencyKey, digest }],
@@ -463,13 +503,19 @@ export class CreationMediaService {
         { id: run.id, revision: run.revision },
         assetsRef,
         scriptRef,
-        { id: entity.id, revision: entity.revision },
+        ...(run.data.results.direction ? [run.data.results.direction] : []),
+        { id: entity!.id, revision: entity!.revision },
       ]);
       return { task: next };
     });
   }
 
-  async deliver(taskId: string, raw: unknown, files: { path: string; originalname: string }[]) {
+  async deliver(
+    taskId: string,
+    raw: unknown,
+    files: { path: string; originalname: string }[],
+    providerJob?: Job,
+  ) {
     const manifest = deliveryManifestSchema.parse(raw);
     this.store.get(taskId);
     let frozen: RecordDoc;
@@ -483,8 +529,16 @@ export class CreationMediaService {
     if (manifest.taskId !== taskId || frozen.kind !== 'asset_task')
       throw new HttpError(409, '交付任务标识或版本不匹配');
     if (
+      providerJob &&
+      (providerJob.kind !== 'image' ||
+        providerJob.input.imageTask.id !== taskId ||
+        providerJob.input.imageTask.revision !== manifest.taskRevision ||
+        manifest.assets.some((a) => a.viewId !== providerJob.input.viewId))
+    )
+      throw new HttpError(400, '模型图片与固定任务或视图不匹配');
+    if (
       manifest.assets.length !== files.length ||
-      manifest.assets.length !== frozen.data.views.length ||
+      manifest.assets.length !== (providerJob ? 1 : frozen.data.views.length) ||
       new Set(files.map((f) => f.originalname)).size !== files.length ||
       new Set(manifest.assets.map((a) => a.file)).size !== files.length ||
       new Set(manifest.assets.map((a) => a.viewId)).size !== files.length
@@ -594,9 +648,11 @@ export class CreationMediaService {
             path: `assets/${s.sha256}${s.ext}`,
             sha256: s.sha256,
             adopted: false,
-            sourceAssetIds: frozen.data.references.map((r: any) => r.id),
-            prompt: frozen.data.requirements,
-            jobId: null,
+            sourceAssetIds: providerJob
+              ? providerJob.input.assets.map((a: any) => a.asset.id)
+              : frozen.data.references.map((r: any) => r.id),
+            prompt: providerJob ? providerJob.input.prepared.finalPrompt : frozen.data.requirements,
+            jobId: providerJob?.id || null,
             production: {
               taskId,
               taskRevision: manifest.taskRevision,
@@ -616,7 +672,10 @@ export class CreationMediaService {
         stale,
         at: Date.now(),
         executionReceipt: manifest.executionReceipt
-          ? { ...manifest.executionReceipt, evidence: 'reported' }
+          ? {
+              ...manifest.executionReceipt,
+              evidence: providerJob ? 'provider_receipt' : 'reported',
+            }
           : null,
       };
       const task = this.store.update(taskId, current.revision, {
@@ -635,8 +694,8 @@ export class CreationMediaService {
   async validateReview(projectId: string, runId: string, raw: unknown) {
     const edl = edlSchema.parse(raw),
       run = new CreationService(this.store).get(runId);
-    if (edl.schemaVersion !== 2 || edl.episodeId !== run.data.episodeId)
-      throw new HttpError(400, '审看编辑需要本作品分集的 EDL v2');
+    if (!edl.schemaVersion || edl.episodeId !== run.data.episodeId)
+      throw new HttpError(400, '审看编辑需要本作品分集的整帧 EDL');
     const assets = new Map<string, RecordDoc>();
     for (const [audioOnly, clips] of [
       [false, edl.clips],

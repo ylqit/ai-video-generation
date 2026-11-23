@@ -318,7 +318,9 @@ export const directingV3Schema = directingV2Schema.extend({
             .shape.dialogue.unwrap()
             .element.extend({
               id: z.string().min(1),
-              voiceProfile: seriesRefSchema,
+              voiceProfile: seriesRefSchema.optional(),
+              production: z.enum(['native', 'imported', 'tts']).optional(),
+              requireVoiceIdentity: z.boolean().optional(),
             }),
         )
         .default([]),

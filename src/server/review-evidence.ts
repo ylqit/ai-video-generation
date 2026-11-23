@@ -281,13 +281,6 @@ export function selectedBoundary(specs: any[], review: any, selection: any) {
         throw new HttpError(409, '边界关系观察互相矛盾');
       return versions[0];
     });
-    for (const relation of spec.state?.[`${side}Relations`] || []) {
-      if (
-        !relationObjectIds.includes(relation.objectId) ||
-        !relations.some((r: any) => generationDigest(r) === generationDigest(relation))
-      )
-        throw new HttpError(409, `${side} 边界关系没有实际证据：${relation.objectId}`);
-    }
     const windows = (review.boundaryWindows || []).filter(
       (w: any) =>
         w.side === side &&

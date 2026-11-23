@@ -1,5 +1,11 @@
+import { registerCanvasRoutes } from './canvas-routes.js';
+import { registerWorkbenchImportRoutes } from './workbench-import.js';
 import { extractFrameAsset } from './media-evidence.js';
+import { registerSpeechRoutes } from './speech-routes.js';
+import { registerSeriesCreationRoutes } from './series-creation-routes.js';
 import { registerMediaLibraryRoutes } from './media-library.js';
+import { registerModelRoutes } from './model-routes.js';
+import { queryProviderVideo } from './provider-media.js';
 import { fileCleared } from './media-retention.js';
 import { prepareContinuation } from './continuation.js';
 import { SeriesProductionService, predecessorCanon } from './series-production.js';
@@ -73,8 +79,10 @@ export function createApp(store: Store, root: string) {
     next();
   });
   app.use(express.json({ limit: '20mb' }));
+  registerModelRoutes(app, store, root);
   registerMediaLibraryRoutes(app, store, root);
   registerCreationRoutes(app, store, root);
+  registerSeriesCreationRoutes(app, store);
   registerWorkspaceRoutes(app, store);
   const upload = multer({
     storage: multer.diskStorage({
@@ -86,6 +94,8 @@ export function createApp(store: Store, root: string) {
   });
   const seriesService = new SeriesProductionService(store),
     assembly = new AssemblyService(store);
+  registerSpeechRoutes(app, store, root, upload);
+  registerWorkbenchImportRoutes(app, store, root, upload);
   app.post('/api/projects/:id/series', (req, res) => {
     service.project(String(req.params.id));
     res
@@ -140,6 +150,7 @@ export function createApp(store: Store, root: string) {
     res.status(201).json(assembly.release(String(req.params.id), req.body));
   });
   registerDomainRoutes(app, store, root, upload);
+  registerCanvasRoutes(app, store, root);
   registerCreationMediaRoutes(app, store, root);
   registerPrevisRoutes(app, store, root, upload);
   registerWorkbenchRoutes(app, store, root);
@@ -410,6 +421,8 @@ export function createApp(store: Store, root: string) {
   app.post('/api/jobs/:id/retry', (req, res) => {
     const j = store.job(req.params.id);
     if (j.state !== 'failed') throw new HttpError(409, '仅失败任务可以恢复；未知提交需先核对');
+    if ((j.input.modelCharge || j.input.speechCharge) && !j.output.descriptor)
+      throw new HttpError(409, '已预留模型额度的请求需要新的明确尝试；不能重置旧任务');
     if (
       (j.kind === 'creative' && j.input.context?.schemaVersion !== 9) ||
       (j.kind === 'generation' &&
@@ -426,7 +439,7 @@ export function createApp(store: Store, root: string) {
       throw new HttpError(409, '云端生成已经失败，重新生成需在分镜界面确认新尝试');
     res.json(
       store.patchJob(j.id, {
-        state: j.output.descriptor ? 'archiving' : 'queued',
+        state: j.kind !== 'creative' && j.output.descriptor ? 'archiving' : 'queued',
         cancelRequested: false,
         error: null,
       }),
@@ -434,7 +447,19 @@ export function createApp(store: Store, root: string) {
   });
   app.post('/api/jobs/:id/suspend-tracking', (req, res) => {
     const j = store.job(req.params.id);
-    if (j.kind !== 'generation' || !['unknown', 'submitted', 'running'].includes(j.state))
+    if (
+      ![
+        'generation',
+        'image',
+        'creative',
+        'voice_clone',
+        'speech',
+        'lipsync',
+        'media_analysis',
+        'transcription',
+      ].includes(j.kind) ||
+      !['unknown', 'submitted', 'running'].includes(j.state)
+    )
       throw new HttpError(409, '只能停止已提交或待核对任务的本机跟踪');
     res.json(
       store.patchJob(j.id, {
@@ -447,11 +472,28 @@ export function createApp(store: Store, root: string) {
   });
   app.post('/api/jobs/:id/resume-tracking', (req, res) => {
     const j = store.job(req.params.id);
-    if (j.kind !== 'generation' || j.state !== 'cancelled' || !j.output.waitSuspended)
+    if (
+      ![
+        'generation',
+        'image',
+        'creative',
+        'voice_clone',
+        'speech',
+        'lipsync',
+        'media_analysis',
+        'transcription',
+      ].includes(j.kind) ||
+      j.state !== 'cancelled' ||
+      !j.output.waitSuspended
+    )
       throw new HttpError(409, '此任务没有暂停跟踪');
     res.json(
       store.patchJob(j.id, {
-        state: j.promptId ? 'submitted' : 'unknown',
+        state: j.output.descriptor
+          ? 'archiving'
+          : j.promptId || j.output.remote?.taskId
+            ? 'submitted'
+            : 'unknown',
         cancelRequested: false,
         output: { ...j.output, waitSuspended: false },
         error: null,
@@ -461,6 +503,56 @@ export function createApp(store: Store, root: string) {
   app.post('/api/jobs/:id/reconcile', async (req, res) => {
     const job = store.job(req.params.id);
     if (job.state !== 'unknown') throw new HttpError(409, '此任务不是未知提交');
+    if (job.input.modelExecution && job.input.modelExecution.protocol !== 'comfy-h3') {
+      if (job.kind !== 'generation') throw new HttpError(409, '此协议没有可关联的视频任务编号');
+      const body = z
+        .object({
+          remoteTaskId: z.string().min(1).max(200),
+          inspected: z.literal(true),
+          evidence: z.string().trim().min(5).max(4000),
+        })
+        .strict()
+        .parse(req.body);
+      const connection = job.input.modelExecution.connection;
+      if (
+        store
+          .jobs()
+          .some(
+            (j) =>
+              j.id !== job.id &&
+              j.output.remote?.taskId === body.remoteTaskId &&
+              j.output.remote?.connectionId === connection.id,
+          )
+      )
+        throw new HttpError(409, '远端编号已经关联另一任务');
+      const remote = {
+        taskId: body.remoteTaskId,
+        connectionId: connection.id,
+        connectionRevision: connection.revision,
+        protocol: job.input.modelExecution.protocol,
+      };
+      const candidate = { ...job, output: { ...job.output, remote } };
+      const receipt = await queryProviderVideo(store, candidate);
+      if (store.job(job.id).state !== 'unknown') throw new HttpError(409, '任务状态已变化');
+      res.json(
+        store.patchJob(job.id, {
+          state: 'submitted',
+          output: {
+            ...job.output,
+            remote,
+            manualAssociation: {
+              inspected: true,
+              evidence: body.evidence,
+              providerModel: receipt.task.model || null,
+              inputVerifiedByProvider: false,
+              at: Date.now(),
+            },
+          },
+          error: null,
+        }),
+      );
+      return;
+    }
     const promptId = z.string().min(1).parse(req.body.promptId),
       client = new ComfyClient(job.input.profile.baseUrl);
     const h = await client.json('/history/' + encodeURIComponent(promptId)),
@@ -491,19 +583,7 @@ export function createApp(store: Store, root: string) {
       throw new HttpError(409, '时间线已变化');
     if (edl.data.owner) throw new HttpError(409, '请通过所属交付计划预览并导出');
     service.validateEdl(edl.projectId, edl.data);
-    const episode = service.owned(edl.parentId!, edl.projectId, 'episode');
-    const target = episode.data.seriesProduction
-      ? undefined
-      : episode.data.dramaturgy?.targetFrames;
-    if (
-      target &&
-      req.body.allowPartial !== true &&
-      Math.round(timelineDuration(edl.data) * 24) !== target
-    )
-      throw new HttpError(
-        409,
-        `正式成片需要 ${target} 帧；当前为 ${Math.round(timelineDuration(edl.data) * 24)} 帧。局部导出请明确选择时间线草稿。`,
-      );
+    const episode = edl.parentId ? service.owned(edl.parentId, edl.projectId, 'episode') : null;
     const assets = [...edl.data.clips, ...edl.data.audio].map((c) =>
       service.owned(c.assetId, edl.projectId, 'asset', c.revision),
     );
@@ -516,12 +596,7 @@ export function createApp(store: Store, root: string) {
           edl: edl.data,
           edlRevision: edl.revision,
           assets,
-          name:
-            (episode.data.seriesProduction
-              ? '[审核版] '
-              : req.body.allowPartial === true
-                ? '[时间线草稿] '
-                : '') + (req.body.name || '成片'),
+          name: req.body.name || '成片',
           partial: req.body.allowPartial === true,
         },
         z.string().min(8).parse(req.body.idempotencyKey),

@@ -1,7 +1,10 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue';
-import { api } from './api';
+import { api, serviceOffline } from './api';
 import { creationSettingsSchema } from '../shared/creation';
+import ModelConnections from './ModelConnections.vue';
+import ModelExecutionSettings from './ModelExecutionSettings.vue';
+const modelRefresh = ref(0);
 const props = defineProps<{ project: any }>();
 const policy = ref<any>(creationSettingsSchema.parse({})),
   revision = ref(0),
@@ -70,10 +73,12 @@ async function saveRuntime() {
         <p>{{ project.data.title }} · 创作与执行政策</p>
       </div>
     </header>
-    <p v-if="error" class="error" role="alert">{{ error }}</p>
+    <p v-if="error && !serviceOffline" class="error" role="alert">{{ error }}</p>
     <p v-if="notice" role="status">{{ notice }}</p>
+    <ModelConnections @changed="modelRefresh++" />
+    <ModelExecutionSettings :project-id="project.id" :refresh-key="modelRefresh" />
     <p v-if="capabilities">
-      视频能力：{{ capabilities.video ? 'H3 已配置' : '待配置' }} ·
+      旧项目默认 ComfyUI：{{ capabilities.video ? '已配置' : '待配置' }} ·
       {{ capabilities.verification === 'saved_probe' ? '已有节点探测' : '尚未探测' }} · 图片参考
       {{
         capabilities.guidedImages.available === true
@@ -81,7 +86,7 @@ async function saveRuntime() {
           : capabilities.guidedImages.available === false
             ? '不可用'
             : '待核验'
-      }}。图片通过任务包制作；音色样本用于听审；动作时序与声音描述作为文字请求，需审核实际视频。
+      }}。显式模型选择使用上方连接与额度。动作时序与声音描述仍需审核实际视频。
     </p>
     <form class="settings-form" @submit.prevent="save">
       <section>
@@ -115,7 +120,7 @@ async function saveRuntime() {
         <p>允许有依据的表演、机位和停顿。关键事件、对白与结局的修改从剧本开始。</p>
       </section>
       <section>
-        <h2>媒体额度</h2>
+        <h2>未固定模型的旧链路额度</h2>
         <label class="check"
           ><input
             v-model="policy.allowance.enabled"
@@ -138,7 +143,7 @@ async function saveRuntime() {
         <p>重做计入额度。Codex 会话的图片制作回执独立记录。</p>
       </section>
       <section>
-        <h2>默认视频输出</h2>
+        <h2>项目默认画布与 ComfyUI 输出</h2>
         <div class="form-row">
           <label
             >宽度<input
@@ -155,13 +160,19 @@ async function saveRuntime() {
           ><label
             >采样步数<input v-model.number="policy.output.steps" type="number" min="1" max="50"
           /></label>
+          <label
+            >生成与交付画幅不同<select v-model="policy.output.mismatch">
+              <option value="require_match">重新准备一致构图</option>
+              <option value="letterbox">明确等比留边</option>
+            </select></label
+          >
         </div>
         <p>实际输入能力在选择执行范围和提交前检查。最终交付始终需要用户确认实际导出。</p>
       </section>
       <button class="primary" :disabled="busy">保存项目设置</button>
     </form>
     <details class="settings-form">
-      <summary>执行服务与能力</summary>
+      <summary>旧项目 ComfyUI 默认服务与能力</summary>
       <label>ComfyUI 地址<input v-model="baseUrl" type="url" /></label
       ><label class="check"><input v-model="newInstance" type="checkbox" />服务实例已更换</label
       ><button @click="saveRuntime">保存服务地址</button>

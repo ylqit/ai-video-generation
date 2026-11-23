@@ -1,4 +1,7 @@
 <script setup lang="ts">
+import VisualTransitions from './VisualTransitions.vue';
+import { timelineMap } from '../shared/edit-timeline';
+import TimelinePlayback from './TimelinePlayback.vue';
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import type { WorkspaceSnapshot } from '../shared/workspace';
 import type { EditDecisionList, RecordDoc } from '../shared/contracts';
@@ -62,17 +65,8 @@ const currentAsset = computed(() =>
     ? allAssets.value.find((a) => a.id === clip.value.assetId && a.revision === clip.value.revision)
     : null,
 );
-const totalFrames = computed(() =>
-  edl.value.clips.reduce((n, c) => n + Math.round((c.out - c.in) * 24), 0),
-);
-const offsets = computed(() => {
-  let frame = 0;
-  return edl.value.clips.map((c) => {
-    const start = frame;
-    frame += Math.round((c.out - c.in) * 24);
-    return start;
-  });
-});
+const totalFrames = computed(() => timelineMap(edl.value).frames);
+const offsets = computed(() => timelineMap(edl.value).clips.map((c) => c.startFrame));
 const activeCues = computed(() =>
   (edl.value.overlays || []).filter((c) => c.startFrame <= frame.value && c.endFrame > frame.value),
 );
@@ -151,6 +145,9 @@ function addAsset(asset: RecordDoc, replace = false) {
     return;
   }
   const value = {
+    ...(edl.value.schemaVersion === 3
+      ? { id: replace ? clip.value.id : browserCrypto.randomUUID() }
+      : {}),
     assetId: asset.id,
     revision: asset.revision,
     in: 0,
@@ -219,7 +216,7 @@ async function seek(target: number) {
     video.value.currentTime = clip.value.in + (frame.value - offsets.value[selected.value]) / 24;
     video.value.volume = clip.value.volume;
   }
-  syncAudio(true);
+  if (edl.value.schemaVersion !== 3) syncAudio(true);
 }
 function syncAudio(force = false) {
   audioElements.value.forEach((element, i) => {
@@ -252,6 +249,7 @@ async function play() {
   playing.value = true;
   previousTime = performance.now();
   await seek(frame.value);
+  if (edl.value.schemaVersion === 3) return;
   if (video.value)
     await video.value.play().catch((e) => {
       error.value = e.message;
@@ -260,7 +258,7 @@ async function play() {
   syncAudio(true);
 }
 function tick(now: number) {
-  if (playing.value && clip.value) {
+  if (playing.value && clip.value && edl.value.schemaVersion !== 3) {
     const next =
       video.value && currentAsset.value?.data.mediaType === 'video'
         ? offsets.value[selected.value] + Math.floor((video.value.currentTime - clip.value.in) * 24)
@@ -294,6 +292,16 @@ function reorder(direction: number) {
 }
 function split() {
   if (!clip.value) return;
+  if (
+    edl.value.schemaVersion === 3 &&
+    (clip.value.transition ||
+      edl.value.clips[selected.value + 1]?.transition ||
+      clip.value.visualFadeInFrames ||
+      clip.value.visualFadeOutFrames)
+  ) {
+    error.value = '分割前先移除涉及该片段的画面转场，再按新边界设置';
+    return;
+  }
   const point = clip.value.in + (frame.value - offsets.value[selected.value]) / 24;
   if (point <= clip.value.in || point >= clip.value.out) {
     error.value = '请将播放头移到片段内部再分割';
@@ -304,8 +312,17 @@ function split() {
     1,
     { ...clip.value, out: point },
     currentAsset.value?.data.mediaType === 'image'
-      ? { ...clip.value, in: 0, out: clip.value.out - point }
-      : { ...clip.value, in: point },
+      ? {
+          ...clip.value,
+          ...(edl.value.schemaVersion === 3 ? { id: browserCrypto.randomUUID() } : {}),
+          in: 0,
+          out: clip.value.out - point,
+        }
+      : {
+          ...clip.value,
+          ...(edl.value.schemaVersion === 3 ? { id: browserCrypto.randomUUID() } : {}),
+          in: point,
+        },
   );
 }
 function setFrame(target: any, key: string, event: Event) {
@@ -680,8 +697,32 @@ onBeforeUnmount(() => {
           加入当前剪辑
         </button>
       </p>
+      <VisualTransitions v-model="edl" />
+      <TimelinePlayback
+        v-if="edl.schemaVersion === 3"
+        :edl="edl"
+        :assets="allAssets"
+        :frame="frame"
+        :playing="playing"
+        @frame="
+          frame = $event;
+          selected = Math.max(
+            0,
+            offsets.findLastIndex((s) => s <= frame),
+          );
+        "
+        @end="stop"
+        @error="
+          error = $event;
+          stop();
+        "
+      />
       <div class="review-stage">
-        <div class="monitor" :style="{ aspectRatio: `${edl.width}/${edl.height}` }">
+        <div
+          v-if="edl.schemaVersion !== 3"
+          class="monitor"
+          :style="{ aspectRatio: `${edl.width}/${edl.height}` }"
+        >
           <video
             v-if="currentAsset?.data.mediaType === 'video'"
             ref="video"
@@ -858,6 +899,7 @@ onBeforeUnmount(() => {
           @click="audioSelection = index"
         >
           <audio
+            v-if="edl.schemaVersion !== 3"
             :ref="
               (el) => {
                 audioElements[index] = el as HTMLAudioElement;

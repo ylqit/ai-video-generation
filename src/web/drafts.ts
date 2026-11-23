@@ -15,6 +15,7 @@ export function useDraft(key: () => string, revision: () => number, value: Ref<a
     conflict = ref<any>(null);
   let timer: ReturnType<typeof setTimeout> | undefined,
     loaded = '',
+    loadedRevision = -1,
     ticket = 0,
     pending: any;
   async function write(entry: any) {
@@ -35,6 +36,7 @@ export function useDraft(key: () => string, revision: () => number, value: Ref<a
     () => [key(), revision()] as const,
     async ([id, rev]) => {
       const current = ++ticket;
+      const initialValue = JSON.stringify(value.value);
       loaded = '';
       conflict.value = null;
       if (timer) clearTimeout(timer);
@@ -49,14 +51,28 @@ export function useDraft(key: () => string, revision: () => number, value: Ref<a
             r.onerror = () => reject(r.error);
           });
         if (current !== ticket) return;
-        if (entry && entry.baseRevision !== rev) {
+        const editedDuringLoad = JSON.stringify(value.value) !== initialValue;
+        if (entry && (entry.baseRevision !== rev || editedDuringLoad)) {
           conflict.value = entry;
-          message.value = '本机草稿基于旧版本，请导出检查；不会覆盖当前版本。';
+          message.value = editedDuringLoad
+            ? '读取草稿期间已有编辑，保留当前内容；请比较存储草稿。'
+            : '本机草稿基于旧版本，请导出检查；不会覆盖当前版本。';
         } else if (entry) {
           value.value = entry.data;
-          message.value = '已恢复本机草稿，尚未保存或审核。';
+          message.value =
+            JSON.stringify(entry.data) === initialValue
+              ? '本机草稿与当前固定版本一致。'
+              : '已恢复本机草稿，尚未保存或审核。';
         }
         loaded = id;
+        loadedRevision = rev;
+        if (!entry && editedDuringLoad)
+          await write({
+            key: id,
+            baseRevision: rev,
+            data: JSON.parse(JSON.stringify(value.value)),
+            updatedAt: Date.now(),
+          });
       } catch (e: any) {
         message.value = '草稿读取失败：' + e.message;
       }
@@ -66,7 +82,7 @@ export function useDraft(key: () => string, revision: () => number, value: Ref<a
   watch(
     value,
     () => {
-      if (!loaded || loaded !== key() || conflict.value) return;
+      if (!loaded || loaded !== key() || loadedRevision !== revision() || conflict.value) return;
       pending = {
         key: loaded,
         baseRevision: revision(),

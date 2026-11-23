@@ -1,3 +1,5 @@
+import { timelineMap } from '../shared/edit-timeline.js';
+import { assertEpisodePlanCurrent } from './episode-plan.js';
 import { validateDeliveryAudio } from './delivery-audio.js';
 import { z } from 'zod';
 import { randomUUID, createHash } from 'node:crypto';
@@ -51,10 +53,12 @@ export class DeliveryService {
 
   draft(runId: string, target: DeliveryTarget) {
     const run = new CreationService(this.store).get(runId);
+    assertEpisodePlanCurrent(this.store, run);
     const groups = this.groups(run, target);
     const results = new CreationService(this.store).adopted(run);
     const editorial = results.editorial?.stage === 'editorial' ? results.editorial : null;
     const output =
+      run.data.effectivePlan?.canvas ||
       run.data.materialized?.output ||
       new CreationService(this.store).settings(run.projectId).data.policy.output;
     const edlDraft: any = {
@@ -205,14 +209,11 @@ export class DeliveryService {
       assertProductionHead(this.store, run);
       if (run.revision !== input.runRevision || run.data.paused)
         throw new HttpError(409, '创作运行已变化或暂停');
-      if (
-        input.edlDraft.episodeId !== run.data.episodeId ||
-        input.edlDraft.clips.some((c) => !c.selection)
-      )
+      if (input.edlDraft.episodeId !== run.data.episodeId)
         throw new HttpError(400, '交付草稿必须引用本分集的真实采用');
       const groups = this.groups(run, input.target);
       const allowed = new Set(groups.flatMap((g: any) => (g.selection ? [g.selection.id] : [])));
-      if (input.edlDraft.clips.some((c) => !allowed.has(c.selection!.id)))
+      if (input.edlDraft.clips.some((c) => c.selection && !allowed.has(c.selection.id)))
         throw new HttpError(409, '采用不属于交付目标');
       const id = randomUUID();
       const owner = {
@@ -238,7 +239,11 @@ export class DeliveryService {
           (scope ? { mode: 'exact', seconds: scope.data.requestedFrames / 24 } : run.data.duration),
         edl: ref(edl),
         selections: [
-          ...new Map(input.edlDraft.clips.map((c) => [c.selection!.id, c.selection!])).values(),
+          ...new Map(
+            input.edlDraft.clips.flatMap((c) =>
+              c.selection ? [[c.selection.id, c.selection] as const] : [],
+            ),
+          ).values(),
         ],
         output: { width: edl.data.width, height: edl.data.height, fps: 24 },
       };
@@ -275,17 +280,14 @@ export class DeliveryService {
       assertProductionHead(this.store, run);
       if (plan.revision !== input.revision || run.revision !== input.runRevision || run.data.paused)
         throw new HttpError(409, '交付或创作版本已变化');
-      if (
-        input.edlDraft.episodeId !== run.data.episodeId ||
-        input.edlDraft.clips.some((c) => !c.selection)
-      )
+      if (input.edlDraft.episodeId !== run.data.episodeId)
         throw new HttpError(400, '需要本分集的真实采用');
       const allowed = new Set(
         this.groups(run, plan.data.target).flatMap((g: any) =>
           g.selection ? [g.selection.id] : [],
         ),
       );
-      if (input.edlDraft.clips.some((c) => !allowed.has(c.selection!.id)))
+      if (input.edlDraft.clips.some((c) => c.selection && !allowed.has(c.selection.id)))
         throw new HttpError(409, '采用不属于交付目标');
       const previous = this.store.get(plan.data.edl.id, plan.data.edl.revision);
       const edl = new StudioService(this.store).saveEdl(
@@ -300,7 +302,11 @@ export class DeliveryService {
         pendingChecks: input.pendingChecks,
         edl: ref(edl),
         selections: [
-          ...new Map(input.edlDraft.clips.map((c) => [c.selection!.id, c.selection!])).values(),
+          ...new Map(
+            input.edlDraft.clips.flatMap((c) =>
+              c.selection ? [[c.selection.id, c.selection] as const] : [],
+            ),
+          ).values(),
         ],
         output: { width: edl.data.width, height: edl.data.height, fps: 24 },
       };
@@ -316,7 +322,8 @@ export class DeliveryService {
     if (plan.kind !== 'creation_delivery_plan') throw new HttpError(400, '不是交付计划');
     const edl = this.store.get(plan.data.edl.id, plan.data.edl.revision);
     const run = new CreationService(this.store).get(plan.parentId!);
-    const blockers: string[] = [...plan.data.pendingChecks];
+    const blockers: string[] = [];
+    const warnings: string[] = [...plan.data.pendingChecks];
     try {
       assertProductionHead(this.store, run);
       if (
@@ -327,75 +334,37 @@ export class DeliveryService {
         edl.data.stale
       )
         throw new HttpError(409, '交付依据已变化或运行暂停');
-      if (plan.data.target.mode === 'scope') resolveScope(this.store, run, plan.data.target.scope);
-      else {
-        const current = new CreationService(this.store).adopted(run);
-        for (const [stage, source] of Object.entries(plan.data.authoring) as [
-          string,
-          CreationRef,
-        ][]) {
-          const saved = this.store.get(source.id, source.revision);
-          if (
-            generationDigest(saved.data.result) !==
-            generationDigest(current[stage as keyof typeof current])
-          )
-            throw new HttpError(409, '完整作品作者依据已变化');
-        }
+      // Authoring and selection changes are visible suggestions. A fixed EDL remains
+      // executable while its actual media, frame ranges and ownership are valid.
+      if (plan.data.target.mode === 'scope') {
+        const scope = this.store.get(plan.data.target.scope.id, plan.data.target.scope.revision);
+        if (scope.projectId !== plan.projectId) throw new HttpError(400, '制作范围不属于本作品');
       }
-      const groups = this.groups(run, plan.data.target);
-      const expected = groups.flatMap((g: any) =>
-        g.parts.map((p: any) => ({
-          assetId: p.video.id,
-          revision: p.video.revision,
-          in: p.in,
-          out: p.out,
-          selection: g.selection,
-        })),
-      );
-      const actual = edl.data.clips.map((c: any) => ({
-        assetId: c.assetId,
-        revision: c.revision,
-        in: c.in,
-        out: c.out,
-        selection: c.selection,
-      }));
-      if (
-        !groups.length ||
-        groups.some((g: any) => !g.selection) ||
-        generationDigest(expected) !== generationDigest(actual)
-      )
-        throw new HttpError(409, '交付范围存在未采用片段、过期采用或区间变化');
       new StudioService(this.store).validateEdl(plan.projectId, edl.data);
-      const frames = edl.data.clips.reduce(
-        (n: number, c: any) => n + Math.round((c.out - c.in) * 24),
-        0,
-      );
-      let cursor = 0;
-      const audioClips = edl.data.clips.map((c: any) => {
-        const startFrame = cursor;
-        cursor += Math.round((c.out - c.in) * 24);
-        return { ...c, startFrame, endFrame: cursor };
-      });
-      blockers.push(
+      const map = timelineMap(edl.data),
+        frames = map.frames;
+      const audioClips = map.clips.map((c) => ({
+        ...c.clip,
+        startFrame: c.startFrame,
+        endFrame: c.endFrame,
+      }));
+      warnings.push(
         ...validateDeliveryAudio(
           this.store,
           this.store.get(plan.data.episode.id),
           edl.data,
           audioClips,
           frames,
-        ).blockers,
+        ).warnings,
       );
       const bounds = durationBounds(plan.data.duration);
       if (bounds && (frames < bounds.minFrames || frames > bounds.maxFrames))
-        throw new HttpError(
-          409,
-          `实际采用 ${frames} 帧不在交付允许范围 ${bounds.minFrames}–${bounds.maxFrames} 帧内`,
-        );
+        warnings.push(`实际时长 ${frames} 帧与目标 ${bounds.minFrames}–${bounds.maxFrames} 帧不同`);
       if (edl.data.audio.some((a: any) => Math.round((a.start + a.out - a.in) * 24) > frames))
         throw new HttpError(409, '音轨超出实际交付，请校对');
       for (const c of [...edl.data.clips, ...edl.data.audio]) {
         const asset = this.store.get(c.assetId, c.revision);
-        if (this.store.get(asset.id).data.stale || fileCleared(this.store, asset.data.path))
+        if (fileCleared(this.store, asset.data.path))
           throw new HttpError(409, '交付素材已失效或已清理');
         if (this.root && !fs.existsSync(inside(this.root, asset.data.path)))
           throw new HttpError(409, '交付素材文件缺失');
@@ -422,6 +391,7 @@ export class DeliveryService {
       plan,
       edl,
       blockers,
+      warnings,
       basisDigest: plan.data.basisDigest,
       exports,
       assets,
@@ -485,7 +455,7 @@ export class DeliveryService {
           edl: edl.data,
           edlRevision: edl.revision,
           assets,
-          name: plan.data.target.mode === 'scope' ? '范围样片 [待确认]' : '完整作品 [待确认]',
+          name: plan.data.target.mode === 'scope' ? '范围样片' : '作品导出',
           partial: false,
           creationRunId: plan.parentId,
           deliveryPlan: ref(plan),
@@ -574,17 +544,13 @@ export class DeliveryService {
         if (hash.digest('hex') !== asset.data.sha256)
           throw new HttpError(409, '实际导出文件哈希不一致');
       }
+      // Finalizing fixes this output, independently of optional observations and story state.
       let release: RecordDoc | null = null;
       if (view.plan.data.target.mode === 'work' && ep.data.seriesProduction) {
         const assembly = new AssemblyService(this.store);
-        const preview = assembly.previewRelease(view.edl.id, {
-          exportAsset: input.exportAsset,
-          canon: input.canon,
-        });
+        const preview = assembly.previewRelease(view.edl.id, { exportAsset: input.exportAsset });
         release = assembly.release(view.edl.id, {
           ...preview,
-          exportAsset: input.exportAsset,
-          canon: input.canon,
           idempotencyKey: input.idempotencyKey,
         });
       }

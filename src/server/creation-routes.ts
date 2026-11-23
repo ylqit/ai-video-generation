@@ -1,3 +1,4 @@
+import { ProductionAssistant } from './production-assistant.js';
 import { creationCapabilities } from './capabilities.js';
 import type { Express } from 'express';
 import { z } from 'zod';
@@ -10,9 +11,32 @@ import { generationDigest } from './h3-guided.js';
 import { ReadinessService } from './readiness.js';
 import { CreationMediaService } from './creation-media.js';
 import { resolveScope } from './workspace.js';
+import { authoringImpact } from './authoring-impact.js';
+import { SubjectBindings } from './subject-bindings.js';
 
 export function registerCreationRoutes(app: Express, store: Store, root: string) {
   const service = new CreationService(store);
+  const bindings = new SubjectBindings(store);
+  app.get('/api/creation-runs/:id/subject-bindings', (req, res) =>
+    res.json(bindings.inspect(String(req.params.id))),
+  );
+  app.put('/api/creation-runs/:id/subject-bindings', (req, res) =>
+    res.json(bindings.save(String(req.params.id), req.body)),
+  );
+  const assistant = new ProductionAssistant(store, root);
+  app.get('/api/creation-runs/:id/assistant-runs', (req, res) => {
+    const run = service.get(String(req.params.id));
+    res.json({
+      items: store.list('assistant_run', run.projectId).filter((d) => d.parentId === run.id),
+    });
+  });
+  app.get('/api/assistant-runs/:id', (req, res) => res.json(assistant.get(String(req.params.id))));
+  app.post('/api/assistant-runs/:id/control', (req, res) =>
+    res.json(assistant.control(String(req.params.id), req.body)),
+  );
+  app.post('/api/creation-runs/:id/results/impact', (req, res) =>
+    res.json(authoringImpact(store, String(req.params.id), req.body)),
+  );
   app.post('/api/creation-runs/:id/reference-confirmations', async (req, res) =>
     res.json(
       await new CreationMediaService(store, root).confirmReferences(

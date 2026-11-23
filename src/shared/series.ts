@@ -1,5 +1,42 @@
 import { z } from 'zod';
+import { voiceApplicationSchema } from './speech.js';
 import { stateFactSchema } from './shot-semantics.js';
+import { deliveryCanvasSchema } from './production-plan.js';
+
+export const factDependencySchema = z
+  .object({
+    mode: z.enum(['previous', 'independent']),
+    reason: z.string().trim().min(1),
+  })
+  .strict();
+export const seasonStorySchema = z
+  .object({
+    goal: z.string().min(1),
+    conflict: z.string().min(1),
+    ending: z.string().min(1),
+    characters: z.array(
+      z
+        .object({
+          key: z.string().min(1),
+          name: z.string().min(1),
+          start: z.string(),
+          change: z.string(),
+          end: z.string(),
+        })
+        .strict(),
+    ),
+    information: z.array(
+      z
+        .object({
+          id: z.string().min(1),
+          statement: z.string().min(1),
+          plantEpisode: z.number().int().positive(),
+          revealEpisode: z.number().int().positive(),
+        })
+        .strict(),
+    ),
+  })
+  .strict();
 
 export const seriesRefSchema = z.object({
   id: z.string().min(1),
@@ -40,11 +77,15 @@ export const seriesInformationSchema = z.object({
 });
 export const seriesProductionSchema = z.object({
   version: z.literal(1),
+  story: seasonStorySchema.optional(),
+  proposal: seriesRefSchema.optional(),
   profile: seriesRefSchema,
   sharedReferences: z.array(seriesRefSchema).default([]),
   voices: z.array(z.object({ instanceId: z.string(), profile: seriesRefSchema })).default([]),
   targetEpisodes: z.number().int().positive().default(20),
   runtime: runtimeSchema.default({ targetFrames: 28800, toleranceFrames: 0 }),
+  canvas: deliveryCanvasSchema.optional(),
+  factDependency: factDependencySchema.optional(),
   slots: z.array(episodeSlotSchema).default([]),
   chronology: z
     .object({
@@ -92,6 +133,8 @@ export const episodeProductionSchema = z.object({
   version: z.literal(1),
   slotId: z.string().min(1),
   runtime: runtimeSchema.optional(),
+  canvas: deliveryCanvasSchema.optional(),
+  factDependency: factDependencySchema.optional(),
   overrides: z
     .record(z.enum(['visual', 'world', 'narrative', 'direction', 'mixedMedia']), z.string())
     .optional(),
@@ -105,7 +148,7 @@ export const episodeProductionSchema = z.object({
     .array(z.object({ informationId: z.string(), shotIds: z.array(z.string()).min(1) }))
     .default([]),
 });
-export const voiceProfileSchema = z.object({
+const legacyVoiceProfileSchema = z.object({
   version: z.literal(1),
   name: z.string().min(1),
   entity: seriesRefSchema,
@@ -127,6 +170,7 @@ export const voiceProfileSchema = z.object({
     )
     .min(1),
 });
+export const voiceProfileSchema = z.union([legacyVoiceProfileSchema, voiceApplicationSchema]);
 export const dialogueTakeSchema = z
   .object({
     version: z.literal(1),
@@ -139,11 +183,19 @@ export const dialogueTakeSchema = z
     in: z.number().nonnegative(),
     out: z.number().positive(),
     actualText: z.string(),
-    source: z.enum(['imported', 'h3_extracted']),
+    source: z.enum(['imported', 'h3_extracted', 'tts']),
+    synthesisJobId: z.string().optional(),
+    sampleRange: z
+      .object({
+        sampleRate: z.number().int().positive(),
+        inSample: z.number().int().nonnegative(),
+        outSample: z.number().int().positive(),
+      })
+      .optional(),
     sourceVideo: seriesRefSchema.optional(),
-    listened: z.literal(true),
-    voiceMatch: z.literal(true),
-    conclusion: z.string().min(1),
+    listened: z.boolean().default(false),
+    voiceMatch: z.boolean().nullable().default(null),
+    conclusion: z.string().default(''),
   })
   .refine((v) => v.out > v.in, '对白采用范围无效');
 export const factSourceSchema = z.discriminatedUnion('kind', [
@@ -229,6 +281,9 @@ export const assemblyReviewSchema = z
     key: z.string(),
     digest: z.string().min(1),
     exportAsset: seriesRefSchema.optional(),
+    presentedEvidence: z
+      .array(z.object({ selection: seriesRefSchema, evidenceId: z.string().min(1) }).strict())
+      .optional(),
     dimensions: z.record(
       z.enum(assemblyDimensions),
       z.enum(['pass', 'issues', 'not_applicable', 'unreviewed']),

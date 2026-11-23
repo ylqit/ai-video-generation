@@ -3,10 +3,14 @@ import { z } from 'zod';
 import { Store, HttpError } from './db.js';
 import { WorkspaceService } from './workspace.js';
 import { scopeInputSchema } from '../shared/workspace.js';
+import { productionMetrics } from './production-metrics.js';
 
 export function registerWorkspaceRoutes(app: Express, store: Store) {
   const service = new WorkspaceService(store);
   const version = z.number().int().positive();
+  app.get('/api/creation-runs/:id/metrics', (req, res) =>
+    res.json(productionMetrics(store, String(req.params.id))),
+  );
   app.get('/api/projects/:id/workspace-records/:recordId', (req, res) => {
     const revision = z.coerce.number().int().positive().parse(req.query.revision);
     const doc = store.get(String(req.params.recordId), revision);
@@ -60,9 +64,13 @@ export function registerWorkspaceRoutes(app: Express, store: Store) {
   });
   app.get('/api/projects/:id/workspace', (req, res) => {
     const query = z
-      .object({ runId: z.string().optional(), episodeId: z.string().optional() })
+      .object({
+        runId: z.string().optional(),
+        episodeId: z.string().optional(),
+        seriesId: z.string().optional(),
+      })
       .parse(req.query);
-    res.json(service.snapshot(String(req.params.id), query.runId, query.episodeId));
+    res.json(service.snapshot(String(req.params.id), query.runId, query.episodeId, query.seriesId));
   });
   app.get('/api/projects/:id/workspace-layout', (req, res) =>
     res.json(service.layout(String(req.params.id))),
